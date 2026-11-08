@@ -36,7 +36,7 @@
     "domain01Uplinks": 8
   },
   "workload": {
-    "mode": "profile",
+    "mode": "service",
     "duration": 60,
     "profiles": [
       {
@@ -64,7 +64,44 @@
         "readShare": 76
       }
     ],
-    "matrix": "时间ms,源端点,目的端点,消息MB,并发,类型\n0,D01-C01,D01-S01,12,12,业务读取\n4,D02-C01,D02-S01,20,32,模型加载\n12,D02-C02,D02-S02,16,16,周期持久化"
+    "matrix": "时间ms,源端点,目的端点,消息MB,并发,类型\n0,D01-C01,D01-S01,12,12,业务读取\n4,D02-C01,D02-S01,20,32,模型加载\n12,D02-C02,D02-S02,16,16,周期持久化",
+    "seconds": 5,
+    "services": [
+      {
+        "domain": "D01",
+        "model": "DeepSeek-V3",
+        "rate": 75,
+        "input": 1800,
+        "output": 80,
+        "instances": 8,
+        "slots": 8,
+        "prefillRate": 60000,
+        "decodeMs": 8,
+        "readMB": 64,
+        "background": 10,
+        "ttftLimit": 110,
+        "tpotLimit": 12,
+        "goodputLimit": 60,
+        "completionLimit": 99
+      },
+      {
+        "domain": "D02",
+        "model": "DeepSeek-V4",
+        "rate": 160,
+        "input": 1800,
+        "output": 64,
+        "instances": 12,
+        "slots": 8,
+        "prefillRate": 60000,
+        "decodeMs": 8,
+        "readMB": 256,
+        "background": 18,
+        "ttftLimit": 115,
+        "tpotLimit": 12,
+        "goodputLimit": 130,
+        "completionLimit": 99
+      }
+    ]
   },
   "limits": {
     "domain01PB": 5,
@@ -78,11 +115,19 @@
     "fault": false
   },
   "search": {
-    "reuse": "8,12,16,20",
-    "newNodes": "16,20,24,28",
+    "reuse": "8,12,16",
+    "newNodes": "20,24",
     "uplinks": "4,8,12",
     "distributions": "集中,均衡",
-    "objective": "cost"
+    "objective": "cost",
+    "newLeaves": "0,2",
+    "enabled": {
+      "uplinks": true,
+      "distributions": true,
+      "newLeaves": false,
+      "newNodes": true,
+      "reuse": true
+    }
   },
   "history": [],
   "plans": [],

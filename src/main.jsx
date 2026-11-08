@@ -54,19 +54,32 @@ import {
   cost,
   hardware,
   LIMITS,
+  NETWORK_DIMENSIONS,
+  searchEnabled,
+  dimensionValues,
+  activeDimensions,
+  validateLimits,
+  targetUplinkCounts,
   topology,
   traffic,
   validate,
 } from "./engine.js";
 import { normalizeNetworkData, normalizeMatrix } from "./network-format.js";
+import { SERVICE_FIELDS, prepareService, serviceProfile } from "./service.js";
+import {
+  ObjectResources,
+  ObjectGraphView,
+  ObjectHeatmap,
+} from "./object-resources.jsx";
+import { inspectModel, applyObjectChanges } from "./topology-model.js";
+import { readObjectWorkbook, singleClusterBundle } from "./topology-io.js";
 import "./style.css";
 
 const MODULES = [
   ["projects", "项目中心", FolderKanban, "01"],
   ["resources", "资源与网络建模", Network, "02"],
   ["workload", "业务负载建模", Layers3, "03"],
-  ["simulation", "仿真与诊断", Activity, "04"],
-  ["planning", "规划寻优与报告", Target, "05"],
+  ["simulation", "评估工作台", Activity, "04"],
 ];
 const STORAGE = "cluster-network-demo-v2";
 const format = (n, d = 1) =>
@@ -126,7 +139,7 @@ const ROLE_STYLE = { existing: "gray", assigned: "teal", added: "blue" };
 const DisplayContext = createContext(DEFAULT_DISPLAY);
 function useProjectNames() {
   const display = useContext(DisplayContext);
-  const domain = (key) => display.domains[key] || key;
+  const domain = (key) => display.domains[key] || key || "共享";
   const role = (key) =>
     ({
       existing: "存量",
@@ -139,20 +152,53 @@ function useProjectNames() {
     );
   return { display, domain, role, label };
 }
+function restoreProject(p) {
+  const display =
+    p.display ??
+    (p.id === seed.id || p.name.startsWith(seed.name)
+      ? seed.display
+      : DEFAULT_DISPLAY);
+  let workload = p.workload;
+  if (p.id === seed.id && !workload.services) {
+    workload = {
+      ...workload,
+      seconds: seed.workload.seconds,
+      services: clone(seed.workload.services),
+      mode: workload.mode === "matrix" ? "matrix" : "service",
+    };
+  }
+  if (workload.mode === "inference") {
+    workload = { ...workload, mode: workload.previousMode ?? "profile" };
+  }
+  const old = (item) => item.input?.workload.mode === "inference";
+  const archived = [...p.history.filter(old), ...p.plans.filter(old)];
+  return {
+    ...p,
+    workload,
+    display,
+    history: p.history.filter((item) => !old(item)),
+    plans: p.plans.filter((item) => !old(item)),
+    ...(archived.length
+      ? { archivedInference: [...(p.archivedInference ?? []), ...archived] }
+      : {}),
+  };
+}
 function load() {
   try {
     const d = normalizeNetworkData(JSON.parse(localStorage.getItem(STORAGE)));
     if (d?.projects?.length) {
+      const retired = d.projects.find((p) => p.id === "pd-inference");
+      const projects = d.projects
+        .filter((p) => p.id !== "pd-inference")
+        .map(restoreProject);
+      if (!projects.length) projects.push(clone(seed));
       return {
         ...d,
-        projects: d.projects.map((p) => ({
-          ...p,
-          display:
-            p.display ??
-            (p.id === seed.id || p.name.startsWith(seed.name)
-              ? seed.display
-              : DEFAULT_DISPLAY),
-        })),
+        projects,
+        active: projects.some((p) => p.id === d.active)
+          ? d.active
+          : projects[0].id,
+        ...(retired ? { retiredExample: retired } : {}),
       };
     }
   } catch {}
@@ -539,6 +585,8 @@ function Heatmap({ result, onPick }) {
       l,
     ]),
   );
+  if (result.objectModel)
+    return <ObjectHeatmap result={result} onPick={onPick} />;
   return (
     <Panel
       title="网络负载热力图"
@@ -630,12 +678,14 @@ function Metrics({ result }) {
       result.checks.find((x) => x.key === "util").pass ? "blue" : "amber",
     ],
     [
-      "P99 完成时延",
+      "P99 通信完成时延",
       result.p99,
       "ms",
       Clock3,
       "取各网络域中较大的 P99",
-      result.checks.find((x) => x.key === "p99").pass ? "blue" : "amber",
+      result.checks.find((x) => x.key === "p99")?.pass === false
+        ? "amber"
+        : "blue",
     ],
     [
       "有效吞吐",
@@ -835,15 +885,15 @@ function Diagnostics({ result, onPick, comparison }) {
               </tr>
             </thead>
             <tbody>
-              {result.checks.map((c, i) => (
+              {result.checks.map((c) => (
                 <tr key={c.key}>
                   <td>{names.label(c.label)}</td>
                   <td>
                     {format(c.value, 3)} {c.unit}
                   </td>
                   <td>
-                    {i === 6 || i === 7 ? "≤" : "≥"} {format(c.limit, 3)}{" "}
-                    {c.unit}
+                    {c.max || ["p99", "util"].includes(c.key) ? "≤" : "≥"}{" "}
+                    {format(c.limit, 3)} {c.unit}
                   </td>
                   <td>
                     <Status pass={c.pass} />
@@ -870,10 +920,25 @@ function SimPage({
   details,
   setDetails,
   openHistory,
+  selectedPlan,
+  setObjective,
+  tab,
+  setTab,
+  changePage,
+  results,
+  reports,
+  onBaselineDetail,
+  baselineAvailable,
 }) {
   const names = useProjectNames();
   const data = result?.result;
-  const selected = project.plans.find((p) => p.id === plan);
+  const selected = selectedPlan;
+  const config = selected?.input.config ?? project.config;
+  const dimensions = activeDimensions(project.config, project.search);
+  const faultName = config.model
+    ? config.model.faultDevices?.join("、")
+    : "SP01";
+  const searching = !selected && dimensions.length > 0;
   const stale =
     result && !same(result.input, selected?.input ?? snapshot(project));
   const prev = project.history.find(
@@ -887,92 +952,197 @@ function SimPage({
   return (
     <>
       <Heading
-        tag="04 / SIMULATION LAB"
-        title="仿真分析工作台"
-        description="运行流级仿真，追踪链路竞争并定位性能瓶颈。"
+        tag="04 / EVALUATION"
+        title="评估工作台"
+        description="使用固定业务负载评估当前组网，并比较资源页放开的候选配置。"
         actions={
           <>
             <Btn icon={History} onClick={openHistory}>
               历史任务
             </Btn>
             <Btn icon={Play} primary disabled={!!task} onClick={() => run()}>
-              {task ? "计算进行中…" : "运行仿真"}
+              {task ? "评估进行中…" : "运行评估"}
             </Btn>
           </>
         }
       />
-      <div className="runbar">
-        <div className="runbar-icon">
-          <SlidersHorizontal size={19} />
-        </div>
-        <Select
-          label="仿真方案"
-          value={plan}
-          onChange={setPlan}
-          options={[
-            ["", "项目基线 · 当前配置"],
-            ...project.plans.map((p) => [p.id, p.name]),
-          ]}
-        />
-        <Select
-          label="运行场景"
-          value={fault ? "fault" : "normal"}
-          onChange={(v) => setFault(v === "fault")}
-          options={[
-            ["normal", "正常场景"],
-            ["fault", "故障场景 · SP01 下线"],
-          ]}
-        />
-        <div className="run-meta">
-          <span className={"dot " + (task ? "pulse" : data ? "green" : "")} />
-          {task
-            ? "正在计算路径与竞争"
-            : data
-              ? "最近运行 " + stamp(result.time)
-              : "等待运行"}
-        </div>
+      <div className="module-tabs">
+        <button
+          className={tab === "results" ? "selected" : ""}
+          onClick={() => setTab("results")}
+        >
+          评估结果
+        </button>
+        <button
+          className={tab === "reports" ? "selected" : ""}
+          onClick={() => setTab("reports")}
+        >
+          方案与报告 · {project.plans.length}
+        </button>
       </div>
-      {data ? (
-        <>
-          {(stale || result.fault !== fault || result.plan !== plan) && (
-            <div className="notice">
-              <TriangleAlert size={16} />{" "}
-              当前显示上次运行快照。运行仿真以应用所选配置。
-            </div>
-          )}
-          <div className="section-label">
-            <span>
-              <span className="section-mark" />
-              仿真结果概览
-            </span>
-            <span className="run-detail">
-              {result.label} <i /> {result.fault ? "故障场景" : "正常场景"}{" "}
-              <i /> {format(data.flowCount, 0)} 条消息
-            </span>
-          </div>
-          <Metrics result={data} />
-          <div className="chart-grid">
-            <Timeline
-              result={data}
-              hot={data.links
-                .filter((l) => l.type === "上联" && l.peak > 0)
-                .slice(0, 3)}
-            />
-            <Heatmap result={data} onPick={setDetails} />
-          </div>
-          <Diagnostics
-            result={data}
-            onPick={setDetails}
-            comparison={comparison}
-          />
-        </>
+      {tab === "reports" ? (
+        reports
       ) : (
-        <Panel title="仿真结果">
-          <Empty
-            title={task ? "正在运行流级仿真" : "等待首次仿真"}
-            detail="选择一个方案后运行仿真，查看性能与链路诊断。"
-          />
-        </Panel>
+        <>
+          <div className="runbar">
+            <div className="runbar-icon">
+              <SlidersHorizontal size={19} />
+            </div>
+            <Select
+              label="评估输入"
+              value={plan}
+              onChange={setPlan}
+              options={[
+                ["", "项目基线 · 当前配置"],
+                ...project.plans.map((p) => [p.id, p.name]),
+                ...(selected?.preview
+                  ? [[selected.id, selected.name + " · 诊断预览"]]
+                  : []),
+              ]}
+            />
+            <Select
+              label="运行场景"
+              value={fault ? "fault" : "normal"}
+              onChange={(v) => setFault(v === "fault")}
+              options={[
+                ["normal", "正常场景"],
+                ...(faultName
+                  ? [["fault", "故障场景 · " + faultName + " 下线"]]
+                  : []),
+              ]}
+            />
+            {searching && (
+              <Select
+                label="方案排序目标"
+                value={project.search.objective}
+                options={Object.entries({
+                  ...objectiveNames,
+                  throughput:
+                    project.workload.mode === "service"
+                      ? "最大化达标请求吞吐"
+                      : objectiveNames.throughput,
+                })}
+                onChange={setObjective}
+              />
+            )}
+            <div className="run-meta">
+              <span
+                className={"dot " + (task ? "pulse" : data ? "green" : "")}
+              />
+              {task
+                ? "正在计算路径与竞争"
+                : data
+                  ? "最近运行 " + stamp(result.time)
+                  : "等待运行"}
+            </div>
+          </div>
+          <div className="evaluation-scope">
+            <Badge tone={searching ? "blue" : "gray"}>
+              {searching ? "比较基线与候选" : "单方案评估"}
+            </Badge>
+            <span>
+              {selected
+                ? "使用所选方案的配置和负载快照。"
+                : searching
+                  ? "资源页已开放 " +
+                    dimensions.length +
+                    " 个维度，本次会筛选并比较合法组合。"
+                  : "当前资源维度全部锁定，仅评估导入或编辑后的基线。"}
+            </span>
+            <button
+              className="text-button"
+              onClick={() => changePage("resources")}
+            >
+              查看资源与可调配置 <ArrowRight size={14} />
+            </button>
+          </div>
+          {results}
+          {data ? (
+            <>
+              {(stale || result.fault !== fault || result.plan !== plan) && (
+                <div className="notice">
+                  <TriangleAlert size={16} />{" "}
+                  当前显示已评估的快照。点击「运行评估」应用所选输入。
+                </div>
+              )}
+              <div className="section-label" id="evaluation-diagnostics">
+                <span>
+                  <span className="section-mark" />
+                  方案诊断
+                </span>
+                <span className="run-detail">
+                  {result.label} <i /> {result.fault ? "故障场景" : "正常场景"}{" "}
+                  <i />{" "}
+                  {data.service
+                    ? format(
+                        data.service.profiles.reduce(
+                          (total, profile) => total + profile.requests,
+                          0,
+                        ),
+                        0,
+                      ) + " 个推理请求"
+                    : format(data.flowCount, 0) + " 条消息"}
+                </span>
+              </div>
+              {data.service && (
+                <ServiceMetrics service={data.service} names={names} />
+              )}
+              <Metrics result={data} />
+              {result.partial ? (
+                <Panel title="链路诊断">
+                  <Empty
+                    title="已复用保存的评估指标"
+                    detail="按需计算链路热力图和时序明细。"
+                  >
+                    <Btn onClick={onBaselineDetail} disabled={!!task}>
+                      查看链路明细
+                    </Btn>
+                  </Empty>
+                </Panel>
+              ) : (
+                <>
+                  <div className="chart-grid">
+                    <Timeline
+                      result={data}
+                      hot={data.links
+                        .filter((l) => l.type === "上联" && l.peak > 0)
+                        .slice(0, 3)}
+                    />
+                    <Heatmap result={data} onPick={setDetails} />
+                  </div>
+                  <Diagnostics
+                    result={data}
+                    onPick={setDetails}
+                    comparison={comparison}
+                  />
+                </>
+              )}
+            </>
+          ) : (
+            <Panel title="仿真结果">
+              <Empty
+                title={
+                  task
+                    ? "正在评估配置"
+                    : baselineAvailable
+                      ? "已复用基线指标"
+                      : "等待运行评估"
+                }
+                detail={
+                  baselineAvailable
+                    ? "候选对比已使用保存的基线指标，链路明细可以按需生成。"
+                    : "运行评估后查看服务性能、热点链路和约束校核。"
+                }
+              >
+                {baselineAvailable && (
+                  <Btn onClick={onBaselineDetail} disabled={!!task}>
+                    查看基线诊断
+                  </Btn>
+                )}
+              </Empty>
+            </Panel>
+          )}
+        </>
       )}
       {details && (
         <Modal title="链路详情" close={() => setDetails(null)}>
@@ -984,6 +1154,11 @@ function SimPage({
               {details.a} ↔ {details.b}
             </h3>
             <p>
+              {details.aPort && (
+                <>
+                  {details.aPort} ↔ {details.bPort}　
+                </>
+              )}
               容量 {format(details.gbps)} Gbps　峰值利用率 {details.peak}
               %　最大经由待传量 {format(details.queue)} MB
             </p>
@@ -1068,7 +1243,10 @@ function ProjectPage({ projects, active, open, create, duplicate, navigate }) {
               <p>{p.description || p.kind}</p>
               <div className="project-stats">
                 <span>
-                  <Network size={15} /> {p.config.spines * 2} 台 Spine
+                  <Network size={15} />{" "}
+                  {p.config.model
+                    ? p.config.model.clusters.length + " 个集群"
+                    : p.config.spines * 2 + " 台 Spine"}
                 </span>
                 <span>
                   <History size={15} /> {p.history.length} 次仿真
@@ -1117,8 +1295,7 @@ function ProjectPage({ projects, active, open, create, duplicate, navigate }) {
                     {
                       resources: "编辑设备、连接及资源池",
                       workload: "配置画像、矩阵及性能目标",
-                      simulation: "运行基线或复核已保存方案",
-                      planning: "比较候选配置并导出报告",
+                      simulation: "评估基线、比较候选并导出报告",
                     }[key]
                   }
                 </small>
@@ -1142,6 +1319,152 @@ const profileFields = [
   ["loadShare", "启动阶段模型加载", "number", "%"],
   ["readShare", "常规读取占比", "number", "%"],
 ];
+function ServiceLoad({ workload, update, names }) {
+  const services = workload.services ?? [];
+  const change = (index, patch) =>
+    update({
+      services: services.map((item, i) =>
+        i === index ? { ...item, ...patch } : item,
+      ),
+    });
+  const field = (definition, item, index) => {
+    const [key, label, suffix, min, max, step] = definition;
+    return (
+      <Field
+        key={key}
+        label={label}
+        suffix={suffix}
+        min={min}
+        max={max}
+        step={step}
+        value={item[key]}
+        onChange={(value) => change(index, { [key]: value })}
+      />
+    );
+  };
+  return (
+    <>
+      <div className="form-top">
+        <Field
+          label="持续施压"
+          suffix="秒"
+          min={2}
+          max={30}
+          value={workload.seconds}
+          onChange={(seconds) => update({ seconds })}
+        />
+        <span className="muted">
+          按固定请求速率持续投放。搜索中的负载和部署配置保持固定。
+        </span>
+      </div>
+      <div className="form-grid two">
+        {services.map((item, index) => (
+          <section className="inner-card" key={index}>
+            <div className="inner-head">
+              <Badge>
+                {names.domain(item.domain)} · 服务 {index + 1}
+              </Badge>
+              <button
+                className="icon-btn"
+                aria-label="移除推理服务"
+                disabled={services.length === 1}
+                onClick={() =>
+                  update({ services: services.filter((_, i) => i !== index) })
+                }
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div className="form-grid three">
+              <Select
+                label="网络域"
+                value={item.domain}
+                options={Object.entries(names.display.domains)}
+                onChange={(domain) => change(index, { domain })}
+              />
+              <Field
+                label="部署模型"
+                type="text"
+                value={item.model}
+                onChange={(model) => change(index, { model })}
+              />
+              {field(SERVICE_FIELDS[0], item, index)}
+            </div>
+            <details className="service-details">
+              <summary>固定部署、存储依赖和服务目标</summary>
+              <div className="form-grid three">
+                {SERVICE_FIELDS.slice(1).map((def) => field(def, item, index))}
+              </div>
+            </details>
+          </section>
+        ))}
+      </div>
+      <div className="form-top">
+        <Btn
+          icon={Plus}
+          disabled={services.length >= 8}
+          onClick={() =>
+            update({
+              services: [
+                ...services,
+                serviceProfile(Object.keys(names.display.domains).at(-1)),
+              ],
+            })
+          }
+        >
+          添加推理服务
+        </Btn>
+      </div>
+    </>
+  );
+}
+
+function ServiceMetrics({ service, names }) {
+  return (
+    <Panel
+      title="推理服务表现"
+      sub="按服务统计实际完成的请求。尾部拆分用于区分存储依赖等待和算力排队。"
+    >
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>网络域 / 模型</th>
+              <th>完成请求</th>
+              <th>P99 首 token</th>
+              <th>P99 TPOT</th>
+              <th>达标吞吐</th>
+              <th>尾部读取等待</th>
+              <th>尾部算力排队</th>
+              <th>校核</th>
+            </tr>
+          </thead>
+          <tbody>
+            {service.profiles.map((row, index) => (
+              <tr key={index}>
+                <td>
+                  <Badge>{names.domain(row.domain)}</Badge> {row.model}
+                </td>
+                <td>
+                  {row.completed} / {row.requests}
+                </td>
+                <td>{format(row.ttft, 2)} ms</td>
+                <td>{format(row.tpot, 2)} ms</td>
+                <td>{format(row.goodput, 2)} 请求/s</td>
+                <td>{format(row.tail.io, 2)} ms</td>
+                <td>{format(row.tail.queue, 2)} ms</td>
+                <td>
+                  <Status pass={row.checks.every((check) => check.pass)} />
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Panel>
+  );
+}
+
 function WorkloadPage({ project, patch, notify }) {
   const names = useProjectNames();
   const { workload: w, limits } = project;
@@ -1170,7 +1493,7 @@ function WorkloadPage({ project, patch, notify }) {
       <Heading
         tag="03 / TRAFFIC MODEL"
         title="业务负载建模"
-        description="定义请求时序和端点通信，并将性能目标保存到项目。"
+        description="录入固定推理部署和基本请求量。也可以选择端点通信模式做网络诊断。"
         actions={
           <Btn
             primary
@@ -1179,18 +1502,14 @@ function WorkloadPage({ project, patch, notify }) {
               try {
                 const errors = validate(project.config);
                 if (errors.length) throw Error(errors[0]);
-                traffic(
+                const evaluate =
+                  w.mode === "service" ? prepareService : traffic;
+                evaluate(
                   w,
                   topology(project.config),
                   project.config.distribution,
                 );
-                if (
-                  LIMITS.some(
-                    ([k]) => !Number.isFinite(limits[k]) || limits[k] < 0,
-                  ) ||
-                  limits.util > 100
-                )
-                  throw Error("请检查性能目标与利用率上限");
+                validateLimits(project.config, limits);
                 setError("");
                 notify("业务负载与约束已校验");
               } catch (e) {
@@ -1204,18 +1523,33 @@ function WorkloadPage({ project, patch, notify }) {
         }
       />
       <Panel
-        title="通信需求"
-        sub="选择业务画像生成流量，或直接录入端点级通信矩阵。"
+        title="负载配置"
+        sub="推理服务用于规划评估，通信画像和矩阵可用于链路诊断。"
         action={
           <div className="segmented">
             {[
-              ["profile", "业务画像"],
+              ["service", "推理服务"],
+              ["profile", "通信画像"],
               ["matrix", "通信矩阵"],
             ].map(([key, label]) => (
               <button
                 key={key}
                 className={w.mode === key ? "selected" : ""}
-                onClick={() => update({ mode: key })}
+                onClick={() =>
+                  update(
+                    key === "service" && !w.services
+                      ? {
+                          mode: key,
+                          seconds: 5,
+                          services: [
+                            serviceProfile(
+                              Object.keys(names.display.domains).at(-1),
+                            ),
+                          ],
+                        }
+                      : { mode: key },
+                  )
+                }
               >
                 {label}
               </button>
@@ -1224,233 +1558,309 @@ function WorkloadPage({ project, patch, notify }) {
         }
       >
         <div className="panel-body">
-          <div className="form-top">
-            <Field
-              label="负载观测窗口"
-              value={w.duration}
-              suffix="ms"
-              min={10}
-              max={400}
-              onChange={(duration) => update({ duration })}
-            />
-            <Btn icon={Braces} onClick={preview}>
-              生成通信预览
-            </Btn>
-          </div>
-          {w.mode === "profile" ? (
-            <>
-              <div className="form-grid two">
-                {w.profiles.map((p, i) => (
-                  <section key={i} className="inner-card">
-                    <div className="inner-head">
-                      <Badge>
-                        {names.domain(p.domain)} · 画像 {i + 1}
-                      </Badge>
-                      <button
-                        className="icon-btn"
-                        aria-label="移除画像"
-                        disabled={w.profiles.length === 1}
-                        onClick={() =>
-                          update({
-                            profiles: w.profiles.filter((_, j) => j !== i),
-                          })
-                        }
-                      >
-                        <X size={16} />
-                      </button>
-                    </div>
-                    <div className="form-grid three">
-                      <Select
-                        label="网络域"
-                        value={p.domain}
-                        options={Object.entries(names.display.domains)}
-                        onChange={(domain) =>
-                          update({
-                            profiles: w.profiles.map((x, j) =>
-                              j === i ? { ...x, domain } : x,
-                            ),
-                          })
-                        }
-                      />
-                      {profileFields.map(([key, label, type, suffix]) => (
-                        <Field
-                          key={key}
-                          label={label}
-                          type={type}
-                          suffix={suffix}
-                          step={key === "messageMB" ? 0.1 : 1}
-                          value={p[key]}
-                          onChange={(value) =>
-                            update({
-                              profiles: w.profiles.map((x, j) =>
-                                j === i ? { ...x, [key]: value } : x,
-                              ),
-                            })
-                          }
-                        />
-                      ))}
-                    </div>
-                  </section>
-                ))}
-              </div>
-              <div className="form-top">
-                <Btn
-                  icon={Plus}
-                  disabled={w.profiles.length >= 8}
-                  onClick={() =>
-                    update({
-                      profiles: [
-                        ...w.profiles,
-                        { ...clone(w.profiles.at(-1)), model: "新业务画像" },
-                      ],
-                    })
-                  }
-                >
-                  添加业务画像
-                </Btn>
-              </div>
-            </>
+          {w.mode === "service" ? (
+            <ServiceLoad workload={w} update={update} names={names} />
           ) : (
             <>
-              <label className="field">
-                <span>CSV / TSV 端点通信记录</span>
-                <textarea
-                  value={w.matrix}
-                  onChange={(e) => update({ matrix: e.target.value })}
-                  rows={8}
-                  spellCheck={false}
+              <div className="form-top">
+                <Field
+                  label="负载观测窗口"
+                  value={w.duration}
+                  suffix="ms"
+                  min={10}
+                  max={400}
+                  onChange={(duration) => update({ duration })}
                 />
-              </label>
-              <div className="form-top">
-                <label className="btn">
-                  <Upload size={16} />
-                  导入 CSV / TSV
-                  <input
-                    hidden
-                    type="file"
-                    accept=".csv,.tsv,.txt"
-                    onChange={async (e) => {
-                      const f = e.target.files[0];
-                      if (f)
-                        update({ matrix: normalizeMatrix(await f.text()) });
-                      e.target.value = "";
-                    }}
-                  />
-                </label>
-                <span className="muted">
-                  列顺序为发送时间、源端点、目的端点、单消息 MB、并发、类型。
-                </span>
-              </div>
-            </>
-          )}
-          {error && (
-            <div className="notice">
-              <TriangleAlert size={15} />
-              {error}
-            </div>
-          )}
-          {matrix && (
-            <>
-              <div className="form-top">
-                <Badge>{matrix.length} 个通信批次</Badge>
-                <Btn
-                  icon={ArrowDownToLine}
-                  onClick={() =>
-                    download(
-                      "通信矩阵.csv",
-                      csv([
-                        [
-                          "时间ms",
-                          "源端点",
-                          "目的端点",
-                          "消息MB",
-                          "并发",
-                          "类型",
-                        ],
-                        ...matrix.map((f) => [
-                          f.time,
-                          f.src,
-                          f.dst,
-                          f.mb,
-                          f.parallel,
-                          f.type,
-                        ]),
-                      ]),
-                      "text/csv",
-                    )
-                  }
-                >
-                  导出矩阵
+                <Btn icon={Braces} onClick={preview}>
+                  生成通信预览
                 </Btn>
               </div>
-              <div className="table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      {[
-                        "时间 ms",
-                        "源端点",
-                        "目的端点",
-                        "消息 MB",
-                        "并发",
-                        "类型",
-                      ].map((h) => (
-                        <th key={h}>{h}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {matrix.slice(0, 10).map((f, i) => (
-                      <tr key={i}>
-                        {[
-                          f.time,
-                          f.src,
-                          f.dst,
-                          format(f.mb, 2),
-                          f.parallel,
-                          f.type,
-                        ].map((v, j) => (
-                          <td key={j}>{v}</td>
-                        ))}
-                      </tr>
+              {w.mode === "profile" ? (
+                <>
+                  <div className="form-grid two">
+                    {w.profiles.map((p, i) => (
+                      <section key={i} className="inner-card">
+                        <div className="inner-head">
+                          <Badge>
+                            {names.domain(p.domain)} · 画像 {i + 1}
+                          </Badge>
+                          <button
+                            className="icon-btn"
+                            aria-label="移除画像"
+                            disabled={w.profiles.length === 1}
+                            onClick={() =>
+                              update({
+                                profiles: w.profiles.filter((_, j) => j !== i),
+                              })
+                            }
+                          >
+                            <X size={16} />
+                          </button>
+                        </div>
+                        <div className="form-grid three">
+                          <Select
+                            label="网络域"
+                            value={p.domain}
+                            options={Object.entries(names.display.domains)}
+                            onChange={(domain) =>
+                              update({
+                                profiles: w.profiles.map((x, j) =>
+                                  j === i ? { ...x, domain } : x,
+                                ),
+                              })
+                            }
+                          />
+                          {profileFields.map(([key, label, type, suffix]) => (
+                            <Field
+                              key={key}
+                              label={label}
+                              type={type}
+                              suffix={suffix}
+                              step={key === "messageMB" ? 0.1 : 1}
+                              value={p[key]}
+                              onChange={(value) =>
+                                update({
+                                  profiles: w.profiles.map((x, j) =>
+                                    j === i ? { ...x, [key]: value } : x,
+                                  ),
+                                })
+                              }
+                            />
+                          ))}
+                        </div>
+                      </section>
                     ))}
-                  </tbody>
-                </table>
-              </div>
+                  </div>
+                  <div className="form-top">
+                    <Btn
+                      icon={Plus}
+                      disabled={w.profiles.length >= 8}
+                      onClick={() =>
+                        update({
+                          profiles: [
+                            ...w.profiles,
+                            {
+                              ...clone(
+                                w.profiles.at(-1) ?? {
+                                  ...seed.workload.profiles[0],
+                                  domain: Object.keys(names.display.domains)[0],
+                                },
+                              ),
+                              model: "新业务画像",
+                            },
+                          ],
+                        })
+                      }
+                    >
+                      添加业务画像
+                    </Btn>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <label className="field">
+                    <span>CSV / TSV 端点通信记录</span>
+                    <textarea
+                      value={w.matrix}
+                      onChange={(e) => update({ matrix: e.target.value })}
+                      rows={8}
+                      spellCheck={false}
+                    />
+                  </label>
+                  <div className="form-top">
+                    <label className="btn">
+                      <Upload size={16} />
+                      导入 CSV / TSV
+                      <input
+                        hidden
+                        type="file"
+                        accept=".csv,.tsv,.txt"
+                        onChange={async (e) => {
+                          const f = e.target.files[0];
+                          if (f)
+                            update({
+                              matrix: project.config.model
+                                ? await f.text()
+                                : normalizeMatrix(await f.text()),
+                            });
+                          e.target.value = "";
+                        }}
+                      />
+                    </label>
+                    <span className="muted">
+                      列顺序为发送时间、源端点、目的端点、单消息
+                      MB、并发、类型。
+                    </span>
+                  </div>
+                </>
+              )}
+              {error && (
+                <div className="notice">
+                  <TriangleAlert size={15} />
+                  {error}
+                </div>
+              )}
+              {matrix && (
+                <>
+                  <div className="form-top">
+                    <Badge>{matrix.length} 个通信批次</Badge>
+                    <Btn
+                      icon={ArrowDownToLine}
+                      onClick={() =>
+                        download(
+                          "通信矩阵.csv",
+                          csv([
+                            [
+                              "时间ms",
+                              "源端点",
+                              "目的端点",
+                              "消息MB",
+                              "并发",
+                              "类型",
+                            ],
+                            ...matrix.map((f) => [
+                              f.time,
+                              f.src,
+                              f.dst,
+                              f.mb,
+                              f.parallel,
+                              f.type,
+                            ]),
+                          ]),
+                          "text/csv",
+                        )
+                      }
+                    >
+                      导出矩阵
+                    </Btn>
+                  </div>
+                  <div className="table-wrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          {[
+                            "时间 ms",
+                            "源端点",
+                            "目的端点",
+                            "消息 MB",
+                            "并发",
+                            "类型",
+                          ].map((h) => (
+                            <th key={h}>{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {matrix.slice(0, 10).map((f, i) => (
+                          <tr key={i}>
+                            {[
+                              f.time,
+                              f.src,
+                              f.dst,
+                              format(f.mb, 2),
+                              f.parallel,
+                              f.type,
+                            ].map((v, j) => (
+                              <td key={j}>{v}</td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
             </>
+          )}
+          {w.mode === "service" && error && (
+            <div className="notice">{error}</div>
           )}
         </div>
       </Panel>
       <Panel
         title="性能目标与可靠性约束"
-        sub="容量、有效吞吐及 IOPS 按域校验。时延取两域的最大 P99。"
+        sub={
+          w.mode === "service"
+            ? "推理目标按各服务校验，此处配置物理容量与可靠性约束。"
+            : "容量、有效吞吐及 IOPS 按域校验。时延取两域的最大 P99。"
+        }
       >
         <div className="panel-body">
           <div className="form-grid four">
-            {LIMITS.map(([key, label, suffix]) => (
-              <Field
-                key={key}
-                label={names.label(label)}
-                suffix={suffix}
-                value={limits[key]}
-                min={0}
-                step={0.1}
-                onChange={(value) =>
-                  patch({ limits: { ...limits, [key]: value } })
-                }
-              />
-            ))}
+            {project.config.model ? (
+              <>
+                <Field
+                  label="最大链路利用率"
+                  suffix="%"
+                  value={limits.util ?? 100}
+                  min={0}
+                  max={100}
+                  onChange={(util) => patch({ limits: { ...limits, util } })}
+                />
+                {Object.entries(names.display.domains).flatMap(([id, title]) =>
+                  [
+                    ["pb", "容量", "PB"],
+                    ["gbps", "有效吞吐", "GB/s"],
+                    ["iops", "完成 IOPS", "IOPS"],
+                  ].map(([key, label, unit]) => (
+                    <Field
+                      key={id + key}
+                      label={title + " " + label}
+                      suffix={unit}
+                      value={limits.clusters?.[id]?.[key]}
+                      min={0}
+                      step={0.1}
+                      onChange={(value) =>
+                        patch({
+                          limits: {
+                            ...limits,
+                            clusters: {
+                              ...limits.clusters,
+                              [id]: {
+                                ...limits.clusters?.[id],
+                                [key]: value === "" ? undefined : value,
+                              },
+                            },
+                          },
+                        })
+                      }
+                    />
+                  )),
+                )}
+              </>
+            ) : (
+              LIMITS.filter(
+                ([key]) =>
+                  w.mode !== "service" || key.endsWith("PB") || key === "util",
+              ).map(([key, label, suffix]) => (
+                <Field
+                  key={key}
+                  label={names.label(label)}
+                  suffix={suffix}
+                  value={limits[key]}
+                  min={0}
+                  step={0.1}
+                  onChange={(value) =>
+                    patch({ limits: { ...limits, [key]: value } })
+                  }
+                />
+              ))
+            )}
           </div>
-          <label className="checkline">
-            <input
-              type="checkbox"
-              checked={limits.fault}
-              onChange={(e) =>
-                patch({ limits: { ...limits, fault: e.target.checked } })
-              }
-            />{" "}
-            寻优候选必须同时通过 SP01 故障场景
-          </label>
+          {(!project.config.model ||
+            project.config.model.faultDevices?.length > 0) && (
+            <label className="checkline">
+              <input
+                type="checkbox"
+                checked={!!limits.fault}
+                onChange={(e) =>
+                  patch({ limits: { ...limits, fault: e.target.checked } })
+                }
+              />{" "}
+              候选必须同时通过
+              {project.config.model ? "已配置的交换机故障" : " SP01 故障"}场景
+            </label>
+          )}
         </div>
       </Panel>
     </>
@@ -1468,24 +1878,107 @@ const groups = [
   ["存储性能画像", "readGBps writeGBps nodeIOPS deviceMs"],
   ["设备与部署单价", "leafCost reuseCost portCost storageCost spineCost"],
 ];
-function ConfigFields({ config, update, keys }) {
+function uplinkCountLabel(config) {
+  const counts = targetUplinkCounts(config);
+  return counts.length > 1
+    ? counts[0] + "–" + counts.at(-1)
+    : String(counts[0] ?? 0);
+}
+
+function DimensionControl({ dimension, project, updateSearch }) {
+  if (
+    !dimension ||
+    !project ||
+    !updateSearch ||
+    (dimension.inventory && !project.config.reuseInventory)
+  )
+    return null;
+  const enabled = searchEnabled(project.search, project.config, dimension);
+  const label = dimension.label;
+  let error = null;
+  if (enabled) {
+    try {
+      dimensionValues(project.config, project.search, dimension);
+    } catch (issue) {
+      error = issue.message;
+    }
+  }
+  return (
+    <div className="dimension-control">
+      <label className="checkline">
+        <input
+          type="checkbox"
+          aria-label={"允许调整" + label}
+          checked={enabled}
+          onChange={(event) =>
+            updateSearch({
+              enabled: {
+                ...project.search.enabled,
+                [dimension.key]: event.target.checked,
+              },
+            })
+          }
+        />
+        允许调整
+      </label>
+      {enabled && (
+        <Field
+          label={label + "候选值"}
+          type="text"
+          value={
+            project.search[dimension.key] ?? project.config[dimension.field]
+          }
+          onChange={(value) => updateSearch({ [dimension.key]: value })}
+        />
+      )}
+      {error && (
+        <small className="dimension-error" role="alert">
+          {error}
+        </small>
+      )}
+    </div>
+  );
+}
+
+function ConfigFields({ config, update, keys, project, updateSearch }) {
   const names = useProjectNames();
   return (
     <div className="form-grid three">
       {hardware
         .filter(([key]) => keys.includes(key))
-        .map(([key, label, unit, min, max, step]) => (
-          <Field
-            key={key}
-            label={names.label(label)}
-            value={config[key]}
-            suffix={unit}
-            min={min}
-            max={max}
-            step={step}
-            onChange={(value) => update({ [key]: value })}
-          />
-        ))}
+        .map(([key, label, unit, min, max, step]) => {
+          const dimension = NETWORK_DIMENSIONS.find(
+            (entry) => entry.field === key,
+          );
+          return (
+            <div
+              key={key}
+              className={
+                dimension && updateSearch ? "resource-parameter" : undefined
+              }
+            >
+              <Field
+                label={names.label(label)}
+                value={config[key]}
+                suffix={unit}
+                min={min}
+                max={max}
+                step={step}
+                onChange={(value) => update({ [key]: value })}
+              />
+              {key === "uplinks" && project?.config.connections && (
+                <small className="muted">
+                  实际上联 {uplinkCountLabel(config)} 条 / Leaf
+                </small>
+              )}
+              <DimensionControl
+                dimension={dimension}
+                project={project}
+                updateSearch={updateSearch}
+              />
+            </div>
+          );
+        })}
     </div>
   );
 }
@@ -1688,7 +2181,7 @@ function TopologyView({ graph, capacities, domain, setDomain, onSelect }) {
     </div>
   );
 }
-function ResourcesPage({ project, patch, notify }) {
+function ResourcesPage({ project, patch, notify, evaluate }) {
   const names = useProjectNames();
   const [displayDraft, setDisplayDraft] = useState(null);
   const [tab, setTab] = useState("拓扑工作台");
@@ -1698,6 +2191,11 @@ function ResourcesPage({ project, patch, notify }) {
   const [template, setTemplate] = useState(false);
   const [fileBusy, setFileBusy] = useState(false);
   const { config } = project;
+  const updateSearch = (change) =>
+    patch({ search: { ...project.search, ...change } });
+  const enabledCount = NETWORK_DIMENSIONS.filter((dimension) =>
+    searchEnabled(project.search, config, dimension),
+  ).length;
   const issues = useMemo(() => validate(config), [config]);
   const graph = useMemo(
     () => (issues.length ? null : topology(config)),
@@ -1707,6 +2205,49 @@ function ResourcesPage({ project, patch, notify }) {
     patch({ config: { ...config, ...diff } });
     setCheck(false);
   };
+  function adopt(model, bundle = {}) {
+    inspectModel(model);
+    const next = { model };
+    const topologyGraph = topology(next);
+    const current = project.config.model ? project.workload : null;
+    const defaultServices = Object.entries(topologyGraph.planes)
+      .filter(([, endpoints]) => endpoints.C.length)
+      .map(([domain, endpoints]) => ({
+        ...serviceProfile(domain),
+        instances: Math.min(
+          8,
+          endpoints.C.reduce(
+            (count, id) => count + topologyGraph.endpoints[id].nodes,
+            0,
+          ),
+        ),
+      }));
+    const workload = bundle.workload ??
+      current ?? {
+        ...project.workload,
+        mode: "service",
+        seconds: 5,
+        services: defaultServices,
+        profiles: defaultServices.map(({ domain, instances }) => ({
+          ...seed.workload.profiles[0],
+          domain,
+          instances,
+          model: "通信画像",
+        })),
+        matrix: "时间ms,源端点,目的端点,消息MB,并发,类型,集群",
+      };
+    const limits = bundle.limits ?? (current ? project.limits : { util: 100 });
+    const search =
+      bundle.search ??
+      (current ? project.search : { objective: "cost", object: {} });
+    const nextLimits = {
+      ...limits,
+      fault: !!(limits.fault && model.faultDevices?.length),
+    };
+    validateLimits(next, nextLimits);
+    patch({ config: next, workload, limits: nextLimits, search });
+    notify("对象拓扑已校验并保存");
+  }
   const importFile = async (e) => {
     const file = e.target.files[0];
     e.target.value = "";
@@ -1718,6 +2259,15 @@ function ResourcesPage({ project, patch, notify }) {
       if (/\.xlsx?$/i.test(file.name)) {
         const x = await import("xlsx");
         const b = x.read(await file.arrayBuffer(), { type: "array" });
+        if (
+          b.Sheets.Clusters ||
+          b.Sheets.Models ||
+          b.Sheets.Devices ||
+          b.Sheets.Ports
+        ) {
+          adopt(readObjectWorkbook(x, b));
+          return;
+        }
         const rows = x.utils.sheet_to_json(b.Sheets[b.SheetNames[0]], {
           header: 1,
           blankrows: false,
@@ -1744,9 +2294,19 @@ function ResourcesPage({ project, patch, notify }) {
         const raw = JSON.parse(
           await file.text().then((s) => s.replace(/^\uFEFF/, "")),
         );
+        const explicit =
+          raw.model ??
+          raw.config?.model ??
+          (raw.version && raw.devices ? raw : null);
+        if (explicit) {
+          adopt(explicit, raw);
+          return;
+        }
         values = raw.config ?? raw;
         importedDisplay = raw.display;
       }
+      if (config.model)
+        throw Error("此项目使用对象拓扑，请导入对象拓扑 JSON 或 Excel");
       values = normalizeNetworkData(values);
       const imported = readDisplay(
         normalizeNetworkData(importedDisplay),
@@ -1838,6 +2398,20 @@ function ResourcesPage({ project, patch, notify }) {
       notify(e.message, "error");
     }
   };
+  if (config.model && graph)
+    return (
+      <ObjectResources
+        project={project}
+        graph={graph}
+        adopt={adopt}
+        patch={patch}
+        notify={notify}
+        download={download}
+        importFile={importFile}
+        fileBusy={fileBusy}
+        evaluate={evaluate}
+      />
+    );
   return (
     <>
       <Heading
@@ -1846,6 +2420,9 @@ function ResourcesPage({ project, patch, notify }) {
         description="编辑设备、端口和资源池，检查网络连接与物理容量。"
         actions={
           <>
+            <Btn onClick={evaluate}>
+              进入评估工作台 <ArrowRight size={15} />
+            </Btn>
             <label className="btn">
               <Upload size={16} />
               {fileBusy ? "导入中…" : "批量导入"}
@@ -1948,7 +2525,15 @@ function ResourcesPage({ project, patch, notify }) {
               </Btn>
             </div>
           </Panel>
-          <Panel title="对象属性" icon={Settings2}>
+          <Panel
+            title="对象属性"
+            icon={Settings2}
+            sub={
+              "当前值用于基线，候选范围单独保存 · 已开放 " +
+              enabledCount +
+              " 个维度"
+            }
+          >
             <div className="panel-body side-fields">
               <Select
                 label="属性分组"
@@ -1960,16 +2545,27 @@ function ResourcesPage({ project, patch, notify }) {
                 config={config}
                 update={update}
                 keys={groups.find((g) => g[0] === group)[1].split(" ")}
+                project={project}
+                updateSearch={updateSearch}
               />
               {group === "存量与新增资源" && (
-                <Select
-                  label="接入与流量分布"
-                  value={config.distribution}
-                  options={["集中", "均衡"]}
-                  onChange={(distribution) =>
-                    update({ distribution, attachments: undefined })
-                  }
-                />
+                <div className="resource-parameter resource-distribution">
+                  <Select
+                    label="接入与流量分布"
+                    value={config.distribution}
+                    options={["集中", "均衡"]}
+                    onChange={(distribution) =>
+                      update({ distribution, attachments: undefined })
+                    }
+                  />
+                  <DimensionControl
+                    dimension={NETWORK_DIMENSIONS.find(
+                      (entry) => entry.field === "distribution",
+                    )}
+                    project={project}
+                    updateSearch={updateSearch}
+                  />
+                </div>
               )}
             </div>
           </Panel>
@@ -2190,10 +2786,22 @@ const objectiveNames = {
   throughput: "最大化有效吞吐",
   margin: "最大化 SLO 余量",
 };
-function PlanPage({
+const plannedConfig = (row, analysis) =>
+  row.config ?? applyObjectChanges(analysis.input.config, row.changes);
+const objectChangeValue = (field, value) =>
+  field === "gbps" ? value + " Gbps" : value ? "启用" : "停用";
+const describeChange = (change) =>
+  change.id +
+  " · " +
+  objectChangeValue(change.field, change.current) +
+  " → " +
+  objectChangeValue(change.field, change.value);
+
+function EvaluationPlans({
   project,
-  patch,
-  runSearch,
+  view,
+  currentFault,
+  inspect,
   task,
   analysis,
   savePlan,
@@ -2203,20 +2811,48 @@ function PlanPage({
   const names = useProjectNames();
   const [filter, setFilter] = useState("全部候选");
   const [picked, setPicked] = useState(null);
-  const [tab, setTab] = useState("寻优工作台");
   const data = analysis?.result;
   const stale =
     analysis &&
     (!same(analysis.input, snapshot(project)) ||
-      !same(analysis.search, project.search));
+      !same(analysis.search, project.search) ||
+      Boolean(analysis.fault) !== currentFault);
   const rec = data?.rows.find((r) => r.id === data.recommended);
+  const objectMode = Boolean((analysis?.input.config ?? project.config).model);
+  const pickedConfig =
+    picked && analysis ? plannedConfig(picked, analysis) : null;
   const baseCost = cost(analysis?.input.config ?? project.config).total;
-  const baseline = project.history.find(
+  const historyBaseline = project.history.find(
     (h) =>
       !h.plan &&
       !h.fault &&
       same(h.input, analysis?.input ?? snapshot(project)),
   );
+  const baseline =
+    historyBaseline ?? (data?.baseline ? { summary: data.baseline } : null);
+  const serviceMode =
+    (analysis?.input.workload ?? project.workload).mode === "service";
+  const dimensionName = (dimension) =>
+    dimension.inventory
+      ? names.role("assigned") + "存储 Leaf 数"
+      : dimension.label;
+  const candidateValue = (dimension, cfg) =>
+    (dimension.field === "uplinks"
+      ? uplinkCountLabel(cfg)
+      : String(cfg[dimension.field])) +
+    (dimension.unit ? " " + dimension.unit : "");
+  const compareThroughput = (result) =>
+    result
+      ? serviceMode
+        ? format(result.service?.throughput) + " 请求/s"
+        : format(
+            objectMode ? result.throughput : result.domains.D02.throughput,
+          ) + " GB/s"
+      : "—";
+  const compareLatency = (result) =>
+    result
+      ? format(serviceMode ? result.service?.p99 : result.p99, 2) + " ms"
+      : "—";
   const rows = data
     ? [...data.rows]
         .filter(
@@ -2250,36 +2886,42 @@ function PlanPage({
       "",
       "## 改造建议",
       "",
-      ...(p.config.reuseLeaves
-        ? [
+      ...(p.config.model
+        ? p.changes?.length
+          ? p.changes.map((change) => "- " + describeChange(change))
+          : ["- 保留基线拓扑。"]
+        : [
+            ...(p.config.reuseLeaves
+              ? [
+                  "- " +
+                    names.domain("D02") +
+                    " " +
+                    names.role("assigned") +
+                    " " +
+                    p.config.reuseLeaves +
+                    " 台存储 Leaf。",
+                ]
+              : []),
             "- " +
               names.domain("D02") +
-              " " +
-              names.role("assigned") +
-              " " +
-              p.config.reuseLeaves +
+              " 新增 " +
+              p.config.newLeaves +
               " 台存储 Leaf。",
-          ]
-        : []),
-      "- " +
-        names.domain("D02") +
-        " 新增 " +
-        p.config.newLeaves +
-        " 台存储 Leaf。",
-      "- " +
-        names.domain("D02") +
-        " 新购 " +
-        p.config.newNodes +
-        " 台存储节点，新增 " +
-        format(p.config.newNodes * p.config.nodePB, 2) +
-        " PB。",
-      "- 每 Leaf " +
-        p.config.uplinks +
-        " × " +
-        p.config.uplinkGbps +
-        "G 上联，采用" +
-        p.config.distribution +
-        "分布。",
+            "- " +
+              names.domain("D02") +
+              " 新购 " +
+              p.config.newNodes +
+              " 台存储节点，新增 " +
+              format(p.config.newNodes * p.config.nodePB, 2) +
+              " PB。",
+            "- 每 Leaf " +
+              uplinkCountLabel(p.config) +
+              " × " +
+              p.config.uplinkGbps +
+              "G 上联，采用" +
+              p.config.distribution +
+              "分布。",
+          ]),
       "",
       "## 新增建设成本",
       "",
@@ -2319,7 +2961,7 @@ function PlanPage({
       ...(p.fault
         ? [
             "",
-            "## SP01 故障校验",
+            "## 交换机故障校验",
             "",
             ...p.fault.checks.map(
               (c) =>
@@ -2342,9 +2984,9 @@ function PlanPage({
         .map(
           (l) =>
             "- " +
-            l.a +
+            (l.aPort ?? l.a) +
             " ↔ " +
-            l.b +
+            (l.bPort ?? l.b) +
             "：" +
             l.ports +
             " 端口，" +
@@ -2356,80 +2998,16 @@ function PlanPage({
   }
   return (
     <>
-      <Heading
-        tag="05 / PLANNING STUDIO"
-        title="规划寻优与报告"
-        description="搜索合法配置，比较成本与性能，并将候选方案提交仿真复核。"
-        actions={
-          <Btn primary icon={Play} disabled={!!task} onClick={runSearch}>
-            {task ? "计算进行中…" : "开始寻优"}
-          </Btn>
-        }
-      />
-      <div className="module-tabs">
-        {["寻优工作台", "方案与报告"].map((t) => (
-          <button
-            key={t}
-            className={tab === t ? "selected" : ""}
-            onClick={() => setTab(t)}
-          >
-            {t}
-            {t === "方案与报告" ? " · " + project.plans.length : ""}
-          </button>
-        ))}
-      </div>
-      {tab === "寻优工作台" ? (
+      {view === "results" ? (
         <>
-          <div className="plan-grid">
+          <div>
             <Panel
-              title="寻优配置"
-              sub={names.label(
-                "单值可固定变量。搜索保留 D01 连接，按选定档位生成 D02 接入与上联。",
-              )}
-              icon={SlidersHorizontal}
-            >
-              <div className="panel-body form-grid two">
-                {[
-                  ...(project.config.reuseInventory
-                    ? [["reuse", names.role("assigned") + " Leaf 数", "台"]]
-                    : []),
-                  ["newNodes", "新购存储节点", "台"],
-                  ["uplinks", "每 Leaf 上联", "条"],
-                  ["distributions", "接入与负载策略", ""],
-                ].map(([key, label, suffix]) => (
-                  <Field
-                    key={key}
-                    label={label}
-                    suffix={suffix}
-                    type="text"
-                    value={project.search[key]}
-                    onChange={(value) =>
-                      patch({ search: { ...project.search, [key]: value } })
-                    }
-                  />
-                ))}
-                <Select
-                  label="优化目标"
-                  value={project.search.objective}
-                  options={Object.entries(objectiveNames)}
-                  onChange={(objective) =>
-                    patch({ search: { ...project.search, objective } })
-                  }
-                />
-                <div className="field">
-                  <span>校验场景</span>
-                  <div className="pill-field">
-                    {project.limits.fault ? "正常 + SP01 故障" : "正常运行"}
-                  </div>
-                </div>
-              </div>
-            </Panel>
-            <Panel
-              title="推荐方案"
+              title="候选评估"
               sub={
                 data
-                  ? objectiveNames[analysis.objective]
-                  : "按所选目标对所有可行方案排序"
+                  ? objectiveNames[analysis.objective] +
+                    (analysis.cachedBaseline ? " · 已复用基线结果" : "")
+                  : "基线与候选使用同一份负载及约束"
               }
               icon={Target}
             >
@@ -2455,16 +3033,24 @@ function PlanPage({
                       {format(rec.cost, 2)} <small>万元</small>
                     </strong>
                   </div>
-                  <p>
-                    {rec.config.reuseLeaves > 0 &&
-                      names.role("assigned") +
-                        " " +
-                        rec.config.reuseLeaves +
-                        " 台 Leaf · "}
-                    新购 {rec.config.newNodes} 台存储 · 每 Leaf{" "}
-                    {rec.config.uplinks} × {rec.config.uplinkGbps}G ·{" "}
-                    {rec.config.distribution}分布
-                  </p>
+                  {objectMode ? (
+                    <p>
+                      {rec.changes.length
+                        ? rec.changes.map(describeChange).join("；")
+                        : "保留基线拓扑"}
+                    </p>
+                  ) : (
+                    <p>
+                      {rec.config.reuseLeaves > 0 &&
+                        names.role("assigned") +
+                          " " +
+                          rec.config.reuseLeaves +
+                          " 台 Leaf · "}
+                      新购 {rec.config.newNodes} 台存储 · 每 Leaf{" "}
+                      {uplinkCountLabel(rec.config)} × {rec.config.uplinkGbps}G
+                      · {rec.config.distribution}分布
+                    </p>
+                  )}
                   <div className="actions">
                     <Btn icon={Network} onClick={() => setPicked(rec)}>
                       配置与对比
@@ -2482,9 +3068,9 @@ function PlanPage({
                       icon={Play}
                       primary
                       disabled={!!task}
-                      onClick={() => verify(savePlan(rec, analysis))}
+                      onClick={() => inspect(rec, analysis)}
                     >
-                      仿真复核
+                      查看推荐诊断
                     </Btn>
                   </div>
                 </div>
@@ -2493,16 +3079,16 @@ function PlanPage({
                   icon={TriangleAlert}
                   title="无可行方案"
                   detail={
-                    data.capacityGap.D01 == null
+                    Object.values(data.capacityGap).every((gap) => gap == null)
                       ? "所有组合均未通过拓扑和端口校验。请查看候选拒绝原因。"
-                      : names.domain("D01") +
-                        " 容量缺口 " +
-                        data.capacityGap.D01 +
-                        " PB，" +
-                        names.domain("D02") +
-                        " 容量缺口 " +
-                        data.capacityGap.D02 +
-                        " PB。请查看候选拒绝原因。"
+                      : Object.entries(data.capacityGap)
+                          .filter(([, gap]) => gap > 0)
+                          .map(
+                            ([id, gap]) =>
+                              names.domain(id) + " 容量缺口 " + gap + " PB",
+                          )
+                          .join("，") ||
+                        "检查候选详情中的性能、连通性或故障约束。"
                   }
                 />
               ) : (
@@ -2545,13 +3131,22 @@ function PlanPage({
                       <tr>
                         {[
                           "方案",
-                          names.role("assigned") + " Leaf",
-                          "新购存储",
-                          "上联",
-                          "分布",
+                          ...(objectMode
+                            ? ["配置变更"]
+                            : [
+                                "沿用 Leaf",
+                                "新购存储节点",
+                                "新增存储 Leaf",
+                                "上联",
+                                "分布",
+                              ]),
                           "建设成本",
-                          names.domain("D02") + " 吞吐",
-                          "P99",
+                          serviceMode
+                            ? "总达标吞吐"
+                            : objectMode
+                              ? "总有效吞吐"
+                              : names.domain("D02") + " 吞吐",
+                          serviceMode ? "最差服务 P99 首 token" : "P99",
                           "校验",
                         ].map((h) => (
                           <th key={h}>{h}</th>
@@ -2563,28 +3158,31 @@ function PlanPage({
                         <td>
                           <b>项目基线</b>
                         </td>
-                        <td>{analysis.input.config.reuseLeaves} 台</td>
-                        <td>{analysis.input.config.newNodes} 台</td>
-                        <td>
-                          {analysis.input.config.uplinks} ×{" "}
-                          {analysis.input.config.uplinkGbps}G
-                        </td>
-                        <td>{analysis.input.config.distribution}</td>
+                        {objectMode ? (
+                          <td>已导入基线</td>
+                        ) : (
+                          <>
+                            <td>{analysis.input.config.reuseLeaves} 台</td>
+                            <td>{analysis.input.config.newNodes} 台</td>
+                            <td>{analysis.input.config.newLeaves} 台</td>
+                            <td>
+                              {uplinkCountLabel(analysis.input.config)} ×{" "}
+                              {analysis.input.config.uplinkGbps}G
+                            </td>
+                            <td>{analysis.input.config.distribution}</td>
+                          </>
+                        )}
                         <td>{format(baseCost, 2)} 万元</td>
-                        <td>
-                          {baseline
-                            ? format(baseline.summary.domains.D02.throughput) +
-                              " GB/s"
-                            : "—"}
-                        </td>
-                        <td>
-                          {baseline
-                            ? format(baseline.summary.p99, 2) + " ms"
-                            : "—"}
-                        </td>
+                        <td>{compareThroughput(baseline?.summary)}</td>
+                        <td>{compareLatency(baseline?.summary)}</td>
                         <td>
                           {baseline ? (
-                            <Status pass={baseline.summary.pass} />
+                            <Status
+                              pass={
+                                baseline.summary.pass &&
+                                (data.baselineFault?.pass ?? true)
+                              }
+                            />
                           ) : (
                             <Badge tone="gray">待仿真</Badge>
                           )}
@@ -2601,22 +3199,27 @@ function PlanPage({
                             </button>
                             {r.pareto && <Badge tone="teal">Pareto</Badge>}
                           </td>
-                          <td>{r.config.reuseLeaves} 台</td>
-                          <td>{r.config.newNodes} 台</td>
-                          <td>
-                            {r.config.uplinks} × {r.config.uplinkGbps}G
-                          </td>
-                          <td>{r.config.distribution}</td>
+                          {objectMode ? (
+                            <td className="object-changes">
+                              {r.changes.length
+                                ? r.changes.map(describeChange).join("；")
+                                : "保留基线"}
+                            </td>
+                          ) : (
+                            <>
+                              <td>{r.config.reuseLeaves} 台</td>
+                              <td>{r.config.newNodes} 台</td>
+                              <td>{r.config.newLeaves} 台</td>
+                              <td>
+                                {uplinkCountLabel(r.config)} ×{" "}
+                                {r.config.uplinkGbps}G
+                              </td>
+                              <td>{r.config.distribution}</td>
+                            </>
+                          )}
                           <td>{format(r.cost, 2)} 万元</td>
-                          <td>
-                            {r.result
-                              ? format(r.result.domains.D02.throughput) +
-                                " GB/s"
-                              : "—"}
-                          </td>
-                          <td>
-                            {r.result ? format(r.result.p99, 2) + " ms" : "—"}
-                          </td>
+                          <td>{compareThroughput(r.result)}</td>
+                          <td>{compareLatency(r.result)}</td>
                           <td>
                             <Status pass={!!r.pass}>
                               {r.pass
@@ -2653,7 +3256,9 @@ function PlanPage({
                     <strong>{p.name}</strong>
                     <p>
                       {format(cost(p.config).total, 2)} 万元 · {stamp(p.time)} ·{" "}
-                      {p.config.distribution}分布
+                      {p.config.model
+                        ? "对象拓扑"
+                        : p.config.distribution + "分布"}
                     </p>
                   </div>
                   <div className="actions">
@@ -2696,8 +3301,10 @@ function PlanPage({
                               "设备",
                               d.id,
                               names.domain(d.plane),
-                              d.type,
-                              names.role(d.role),
+                              d.modelName
+                                ? d.type + " · " + d.modelName
+                                : d.type,
+                              names.role(d.state ?? d.role),
                               d.ports,
                               "",
                             ]),
@@ -2705,8 +3312,8 @@ function PlanPage({
                               .filter((l) => l.ports)
                               .map((l) => [
                                 "链路",
-                                l.a,
-                                l.b,
+                                l.aPort ?? l.a,
+                                l.bPort ?? l.b,
                                 l.type,
                                 "",
                                 l.ports,
@@ -2746,16 +3353,85 @@ function PlanPage({
                 {format(picked.cost - baseCost, 2)} 万元
               </Badge>
             </div>
-            <p>
-              {picked.config.reuseLeaves > 0 &&
-                names.role("assigned") +
-                  " " +
-                  picked.config.reuseLeaves +
-                  " 台 Leaf，"}
-              新增 {picked.config.newLeaves} 台 Leaf，新购{" "}
-              {picked.config.newNodes} 台存储节点，采用 {picked.config.uplinks}{" "}
-              × {picked.config.uplinkGbps}G 上联。
-            </p>
+            {objectMode ? (
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>对象</th>
+                      <th>参数</th>
+                      <th>基线</th>
+                      <th>候选</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {picked.changes.map((change) => (
+                      <tr
+                        key={
+                          change.collection +
+                          "/" +
+                          change.id +
+                          "/" +
+                          change.field
+                        }
+                      >
+                        <td>{change.id}</td>
+                        <td>
+                          {change.field === "gbps" ? "链路速率" : "启用状态"}
+                        </td>
+                        <td>
+                          {objectChangeValue(change.field, change.current)}
+                        </td>
+                        <td>{objectChangeValue(change.field, change.value)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                {!picked.changes.length && <p>此候选沿用基线配置。</p>}
+              </div>
+            ) : (
+              <>
+                <p>
+                  {picked.config.reuseLeaves > 0 &&
+                    names.role("assigned") +
+                      " " +
+                      picked.config.reuseLeaves +
+                      " 台 Leaf，"}
+                  新增 {picked.config.newLeaves} 台 Leaf，新购{" "}
+                  {picked.config.newNodes} 台存储节点，采用{" "}
+                  {uplinkCountLabel(picked.config)} × {picked.config.uplinkGbps}
+                  G 上联。
+                </p>
+                <div className="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>网络维度</th>
+                        <th>基线值</th>
+                        <th>候选值</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {NETWORK_DIMENSIONS.filter(
+                        (dimension) =>
+                          picked.config[dimension.field] !==
+                          analysis.input.config[dimension.field],
+                      ).map((dimension) => (
+                        <tr key={dimension.key}>
+                          <td>{dimensionName(dimension)}</td>
+                          <td>
+                            {candidateValue(dimension, analysis.input.config)}
+                          </td>
+                          <td>
+                            <b>{candidateValue(dimension, picked.config)}</b>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
             {picked.issues.map((x) => (
               <div className="notice" key={x}>
                 <TriangleAlert size={15} />
@@ -2765,11 +3441,15 @@ function PlanPage({
             {picked.result && (
               <>
                 <div className="mini-topology">
-                  <TopologyView
-                    graph={topology(picked.config)}
-                    capacities={capacity(picked.config)}
-                    domain="D02"
-                  />
+                  {objectMode ? (
+                    <ObjectGraphView graph={topology(pickedConfig)} />
+                  ) : (
+                    <TopologyView
+                      graph={topology(pickedConfig)}
+                      capacities={capacity(pickedConfig)}
+                      domain="D02"
+                    />
+                  )}
                 </div>
                 <div className="table-wrap">
                   <table>
@@ -2783,12 +3463,17 @@ function PlanPage({
                       </tr>
                     </thead>
                     <tbody>
-                      {picked.result.checks.map((c, i) => (
+                      {picked.result.checks.map((c) => (
                         <tr key={c.key}>
                           <td>{names.label(c.label)}</td>
                           <td>
                             {baseline
-                              ? format(baseline.summary.checks[i].value, 3)
+                              ? format(
+                                  baseline.summary.checks.find(
+                                    (check) => check.key === c.key,
+                                  )?.value,
+                                  3,
+                                )
                               : "—"}
                           </td>
                           <td>
@@ -2796,8 +3481,19 @@ function PlanPage({
                           </td>
                           {picked.fault && (
                             <td>
-                              <Status pass={picked.fault.checks[i].pass}>
-                                {format(picked.fault.checks[i].value, 3)}
+                              <Status
+                                pass={
+                                  picked.fault.checks.find(
+                                    (check) => check.key === c.key,
+                                  )?.pass
+                                }
+                              >
+                                {format(
+                                  picked.fault.checks.find(
+                                    (check) => check.key === c.key,
+                                  )?.value,
+                                  3,
+                                )}
                               </Status>
                             </td>
                           )}
@@ -2825,10 +3521,10 @@ function PlanPage({
                     disabled={!!task}
                     onClick={() => {
                       setPicked(null);
-                      verify(savePlan(picked, analysis));
+                      inspect(picked, analysis);
                     }}
                   >
-                    仿真复核
+                    查看候选诊断
                   </Btn>
                 </div>
               </>
@@ -2842,27 +3538,33 @@ function PlanPage({
 const DownloadIcon = ArrowDownToLine;
 function App() {
   const [db, setDb] = useState(load);
+  const pageFromHash = () =>
+    location.hash === "#planning" ? "simulation" : location.hash.slice(1);
   const [page, setPage] = useState(() =>
-    MODULES.some((m) => m[0] === location.hash.slice(1))
-      ? location.hash.slice(1)
-      : "projects",
+    MODULES.some((m) => m[0] === pageFromHash()) ? pageFromHash() : "projects",
   );
   const [task, setTask] = useState(null);
   const [result, setResult] = useState(null);
   const [details, setDetails] = useState(null);
   const [plan, setPlan] = useState("");
+  const [previewPlan, setPreviewPlan] = useState(null);
+  const [workbenchTab, setWorkbenchTab] = useState("results");
   const [fault, setFault] = useState(false);
   const [dialog, setDialog] = useState(null);
   const [toast, setToast] = useState(null);
   const [menu, setMenu] = useState(false);
   const [name, setName] = useState("");
-  const [kind, setKind] = useState("通用 Clos 规划");
-  const [starter, setStarter] = useState("standard");
+  const [kind, setKind] = useState("通用网络规划");
+  const [starter, setStarter] = useState("objects");
   const worker = useRef(null);
   const notified = useRef(null);
-  const initial = useRef(false);
   const p = db.projects.find((x) => x.id === db.active) ?? db.projects[0];
-  const currentPlan = p.plans.find((x) => x.id === plan);
+  const currentPlan =
+    previewPlan?.id === plan ? previewPlan : p.plans.find((x) => x.id === plan);
+  const selectedModel = (currentPlan?.input.config ?? p.config).model;
+  useEffect(() => {
+    if (selectedModel && !selectedModel.faultDevices?.length) setFault(false);
+  }, [selectedModel]);
   const notify = (message, type = "ok") => {
     clearTimeout(notified.current);
     setToast({ message, type });
@@ -2880,7 +3582,7 @@ function App() {
   }, [db]);
   useEffect(() => {
     const sync = () => {
-      const slug = location.hash.slice(1);
+      const slug = pageFromHash();
       if (MODULES.some((m) => m[0] === slug)) setPage(slug);
     };
     window.addEventListener("hashchange", sync);
@@ -2915,6 +3617,8 @@ function App() {
     setDb((prev) => ({ ...prev, active: id }));
     setResult(null);
     setPlan("");
+    setPreviewPlan(null);
+    setWorkbenchTab("results");
     setFault(false);
     setDialog(null);
     changePage("simulation");
@@ -2947,19 +3651,64 @@ function App() {
         return;
       }
       if (type === "search") {
-        patchFor(p.id, {
+        const { baselineDetail, ...analysisResult } = data.result;
+        const selectedFault = Boolean(options.fault);
+        const fresh = baselineDetail && {
+          id: uuid(),
+          time,
+          input,
+          fault: selectedFault,
+          plan: "",
+          label: "项目基线",
+          summary: summary(baselineDetail),
+        };
+        const cachedMetrics = selectedFault
+          ? analysisResult.baselineFault
+          : analysisResult.baseline;
+        setResult((previous) => {
+          if (fresh) return { ...fresh, result: baselineDetail };
+          if (
+            previous &&
+            !previous.partial &&
+            previous.fault === selectedFault &&
+            same(previous.input, input)
+          )
+            return { ...previous, plan: "", label: "项目基线" };
+          return cachedMetrics
+            ? {
+                time,
+                input,
+                fault: selectedFault,
+                plan: "",
+                label: "项目基线",
+                summary: cachedMetrics,
+                result: cachedMetrics,
+                partial: true,
+              }
+            : null;
+        });
+        patchFor(p.id, (previous) => ({
           analysis: {
             time,
             input,
             search: options.search,
             objective: options.search.objective,
-            result: data.result,
+            fault: selectedFault,
+            cachedBaseline: Boolean(
+              selectedFault
+                ? options.cached?.baselineFault
+                : options.cached?.baseline,
+            ),
+            result: analysisResult,
           },
-        });
+          ...(fresh
+            ? { history: [fresh, ...previous.history].slice(0, 40) }
+            : {}),
+        }));
         notify(
-          data.result.recommended
-            ? "寻优完成 · " + data.result.feasible + " 个可行方案"
-            : "寻优完成 · 无可行方案",
+          analysisResult.recommended
+            ? "评估完成 · " + analysisResult.feasible + " 个可行方案"
+            : "评估完成 · 无可行方案",
         );
       } else {
         const entry = {
@@ -2972,13 +3721,19 @@ function App() {
           summary: summary(data.result),
         };
         setResult({ ...entry, result: data.result });
-        if (!options.entry)
+        if (!options.entry && !options.preview && !options.skipHistory)
           patchFor(p.id, (prev) => ({
             history: [entry, ...prev.history].slice(0, 40),
           }));
+        if (options.scroll)
+          requestAnimationFrame(() =>
+            document
+              .getElementById("evaluation-diagnostics")
+              ?.scrollIntoView({ block: "start", behavior: "smooth" }),
+          );
         if (!options.quiet)
           notify(
-            "仿真完成 · " +
+            "评估完成 · " +
               (data.result.pass ? "全部约束通过" : "存在未达标项"),
           );
       }
@@ -2988,34 +3743,134 @@ function App() {
       ...input,
       fault: options.fault,
       search: options.search,
+      cached: options.cached,
+      detail: options.detail,
     });
   }
   function run(over) {
     const selected = over?.plan ?? currentPlan;
-    const input = over?.entry?.input ?? selected?.input ?? snapshot(p);
+    const input =
+      over?.entry?.input ?? over?.input ?? selected?.input ?? snapshot(p);
     const selectedFault = over?.entry?.fault ?? over?.fault ?? fault;
     launch("simulate", input, {
       ...over,
       fault: selectedFault,
       plan: over?.entry?.plan ?? selected?.id ?? "",
       label: over?.entry?.label ?? selected?.name ?? "项目基线",
+      preview: selected?.preview,
     });
   }
-  useEffect(() => {
-    if (initial.current) return;
-    initial.current = true;
-    if (page === "simulation") {
-      const entry = p.history.find(
-        (x) => !x.plan && !x.fault && same(x.input, snapshot(p)),
-      );
-      run({ entry, quiet: true, fault: false });
+  function evaluate() {
+    if (worker.current) return;
+    setWorkbenchTab("results");
+    const input = currentPlan?.input ?? snapshot(p);
+    const match = (item, scene) =>
+      item && item.fault === scene && same(item.input, input);
+    const memory = match(result, fault) ? result : null;
+    const enabled = activeDimensions(input.config, p.search).length > 0;
+    const prior =
+      p.analysis && same(p.analysis.input, input) ? p.analysis.result : null;
+    const historical = (scene) => p.history.find((item) => match(item, scene));
+    const cached = {
+      baseline:
+        (match(result, false) ? result.summary : null) ??
+        historical(false)?.summary ??
+        prior?.baseline,
+      baselineFault:
+        (match(result, true) ? result.summary : null) ??
+        historical(true)?.summary ??
+        prior?.baselineFault,
+    };
+    if (currentPlan || !enabled) {
+      const stored =
+        (fault ? cached.baselineFault : cached.baseline) ??
+        (fault ? currentPlan?.fault : currentPlan?.result);
+      if (memory || stored) {
+        const reused = memory ?? {
+          time:
+            historical(fault)?.time ??
+            currentPlan?.time ??
+            p.analysis?.time ??
+            Date.now(),
+          input,
+          fault,
+          result: stored,
+          summary: stored,
+          partial: true,
+        };
+        setResult({
+          ...reused,
+          plan: currentPlan?.id ?? "",
+          label: currentPlan?.name ?? "项目基线",
+        });
+        notify("已复用相同输入的评估结果");
+      } else run();
+      return;
     }
-  }, []);
+    launch("search", input, {
+      search: clone(p.search),
+      fault,
+      cached,
+      detail: !(fault ? cached.baselineFault : cached.baseline),
+    });
+  }
+
+  function inspect(row, analysis) {
+    const candidate = {
+      id: "preview-" + analysis.time + "-" + row.id,
+      name: row.id,
+      preview: true,
+      input: { ...analysis.input, config: plannedConfig(row, analysis) },
+    };
+    setPreviewPlan(candidate);
+    setPlan(candidate.id);
+    setWorkbenchTab("results");
+    run({ plan: candidate, fault, scroll: true });
+  }
+
+  function baselineDetails() {
+    if (result?.partial) {
+      setPlan(result.plan);
+      setFault(result.fault);
+      run({
+        input: result.input,
+        fault: result.fault,
+        plan: {
+          id: result.plan,
+          name: result.label,
+          preview: currentPlan?.preview,
+        },
+        skipHistory: true,
+        scroll: true,
+      });
+      return;
+    }
+    const analysis = p.analysis;
+    if (!analysis) return;
+    const scene = Boolean(analysis.fault);
+    setPlan("");
+    setFault(scene);
+    run({
+      plan: { id: "", name: "项目基线", input: analysis.input },
+      fault: scene,
+      skipHistory: true,
+      scroll: true,
+    });
+  }
   function addProject() {
     if (!name.trim()) return;
     const id = uuid();
     const d = clone(seed);
-    if (starter === "standard") {
+    if (starter === "objects") {
+      const { model, workload, limits, search } = singleClusterBundle();
+      Object.assign(d, {
+        config: { model },
+        workload,
+        limits,
+        search,
+        display: clone(DEFAULT_DISPLAY),
+      });
+    } else {
       d.display = clone(DEFAULT_DISPLAY);
       if (kind === "网络容量规划")
         d.display.domains = { D01: "现网域", D02: "扩容域" };
@@ -3048,6 +3903,10 @@ function App() {
         peak: i ? 72 : 48,
       }));
       d.search.reuse = "0";
+      d.workload.services = [
+        serviceProfile("D01", "参考服务"),
+        serviceProfile("D02", "目标服务"),
+      ];
     }
     const item = {
       ...d,
@@ -3055,14 +3914,16 @@ function App() {
       name: name.trim(),
       kind,
       description:
-        starter === "standard"
-          ? "从双网络域 Clos 模板创建，可编辑设备、端口、负载与约束。"
-          : seed.description,
+        starter === "objects"
+          ? "从对象拓扑模板创建，可导入任意集群、设备型号与物理连接。"
+          : "从双网络域 Clos 模板创建，可编辑设备、端口、负载与约束。",
     };
     abort();
     setDb((prev) => ({ active: id, projects: [item, ...prev.projects] }));
     setResult(null);
     setPlan("");
+    setPreviewPlan(null);
+    setWorkbenchTab("results");
     setFault(false);
     setDialog(null);
     changePage("resources");
@@ -3078,12 +3939,17 @@ function App() {
     const id = "plan-" + analysis.time + "-" + row.id;
     const existing = p.plans.find((x) => x.id === id);
     if (existing) return existing;
+    const config = plannedConfig(row, analysis);
     const item = {
       id,
-      name: row.id + " · " + row.config.distribution + "接入",
+      name:
+        row.id +
+        " · " +
+        (config.model ? "拓扑方案" : config.distribution + "接入"),
       time: Date.now(),
-      config: row.config,
-      input: { ...analysis.input, config: row.config },
+      config,
+      input: { ...analysis.input, config },
+      ...(row.changes ? { changes: row.changes } : {}),
       result: row.result,
       fault: row.fault,
       baseCost: cost(analysis.input.config).total,
@@ -3094,8 +3960,8 @@ function App() {
   function verify(item) {
     setPlan(item.id);
     setFault(false);
-    changePage("simulation");
-    run({ plan: item, fault: false });
+    setWorkbenchTab("results");
+    run({ plan: item, fault: false, scroll: true });
   }
   const current = MODULES.find((m) => m[0] === page);
   return (
@@ -3181,7 +4047,18 @@ function App() {
             </div>
           </div>
         </header>
-        <DisplayContext.Provider value={p.display ?? DEFAULT_DISPLAY}>
+        <DisplayContext.Provider
+          value={
+            p.config.model
+              ? {
+                  assigned: p.display?.assigned ?? "沿用",
+                  domains: Object.fromEntries(
+                    p.config.model.clusters.map(({ id, name }) => [id, name]),
+                  ),
+                }
+              : (p.display ?? DEFAULT_DISPLAY)
+          }
+        >
           <main className="content" key={p.id + "-" + page}>
             {page === "projects" && (
               <ProjectPage
@@ -3190,8 +4067,8 @@ function App() {
                 open={open}
                 create={() => {
                   setName("");
-                  setKind("通用 Clos 规划");
-                  setStarter("standard");
+                  setKind("通用网络规划");
+                  setStarter("objects");
                   setDialog("new");
                 }}
                 duplicate={duplicate}
@@ -3199,7 +4076,15 @@ function App() {
               />
             )}
             {page === "resources" && (
-              <ResourcesPage project={p} patch={patch} notify={notify} />
+              <ResourcesPage
+                project={p}
+                patch={patch}
+                notify={notify}
+                evaluate={() => {
+                  setWorkbenchTab("results");
+                  changePage("simulation");
+                }}
+              />
             )}
             {page === "workload" && (
               <WorkloadPage project={p} patch={patch} notify={notify} />
@@ -3207,35 +4092,56 @@ function App() {
             {page === "simulation" && (
               <SimPage
                 project={p}
-                run={run}
+                run={evaluate}
                 task={task}
                 result={result}
                 plan={plan}
                 setPlan={setPlan}
+                selectedPlan={currentPlan}
+                setObjective={(objective) =>
+                  patch({ search: { ...p.search, objective } })
+                }
                 fault={fault}
                 setFault={setFault}
                 details={details}
                 setDetails={setDetails}
                 openHistory={() => setDialog("history")}
-              />
-            )}
-            {page === "planning" && (
-              <PlanPage
-                project={p}
-                patch={patch}
-                runSearch={() =>
-                  launch("search", snapshot(p), {
-                    search: {
-                      ...p.search,
-                      reuse: p.config.reuseInventory ? p.search.reuse : "0",
-                    },
-                  })
+                tab={workbenchTab}
+                setTab={setWorkbenchTab}
+                changePage={changePage}
+                baselineAvailable={
+                  !currentPlan && Boolean(p.analysis?.result.baseline)
                 }
-                task={task}
-                analysis={p.analysis}
-                savePlan={savePlan}
-                verify={verify}
-                notify={notify}
+                onBaselineDetail={baselineDetails}
+                results={
+                  (task?.type === "search" ||
+                    (p.analysis &&
+                      activeDimensions(p.config, p.search).length > 0)) && (
+                    <EvaluationPlans
+                      view="results"
+                      currentFault={fault}
+                      project={p}
+                      task={task}
+                      analysis={p.analysis}
+                      savePlan={savePlan}
+                      verify={verify}
+                      inspect={inspect}
+                      notify={notify}
+                    />
+                  )
+                }
+                reports={
+                  <EvaluationPlans
+                    view="reports"
+                    project={p}
+                    task={task}
+                    analysis={p.analysis}
+                    savePlan={savePlan}
+                    verify={verify}
+                    inspect={inspect}
+                    notify={notify}
+                  />
+                }
               />
             )}
             <footer className="footer">
@@ -3306,7 +4212,7 @@ function App() {
               value={kind}
               onChange={setKind}
               options={[
-                "通用 Clos 规划",
+                "通用网络规划",
                 "存储网络改造",
                 "网络容量规划",
                 "推理网络部署",
@@ -3318,10 +4224,15 @@ function App() {
               value={starter}
               onChange={setStarter}
               options={[
-                ["standard", "标准双域 Clos"],
-                ["case", "哈尔滨移动示例副本"],
+                ["objects", "单集群对象拓扑"],
+                ["standard", "双域 Clos 参数模板"],
               ]}
             />
+            <p className="muted">
+              {starter === "objects"
+                ? "资源页按集群、物理网络、型号、设备、端口、链路和资源池编辑，可在模板上增加集群。"
+                : "资源页按设备数量、端口档位和资源池参数生成双域 Clos，与哈尔滨预置项目使用同一种编辑界面。"}
+            </p>
             <div className="actions end">
               <Btn type="button" onClick={() => setDialog(null)}>
                 取消
@@ -3346,8 +4257,10 @@ function App() {
                     <strong>{item.label}</strong>
                     <p>
                       {stamp(item.time)} ·{" "}
-                      {item.fault ? "SP01 故障" : "正常运行"} · P99{" "}
-                      {format(item.summary.p99, 2)} ms
+                      {item.fault ? "SP01 故障" : "正常运行"} ·{" "}
+                      {item.summary.service ? "P99 首 token" : "P99 消息完成"}{" "}
+                      {format(item.summary.service?.p99 ?? item.summary.p99, 2)}{" "}
+                      ms
                     </p>
                   </div>
                   <Status pass={item.summary.pass} />

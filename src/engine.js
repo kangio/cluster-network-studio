@@ -1,3 +1,13 @@
+import {
+  inspectModel,
+  objectCapacity,
+  objectCost,
+  objectTopology,
+  objectDimensions,
+  objectCandidates,
+} from "./topology-model.js";
+import { prepareService, finishService } from "./service.js";
+import { allocateFlows, EPS, route } from "./network-core.js";
 import { normalizeMatrix } from "./network-format.js";
 const seq = (n) => Array.from({ length: n }, (_, i) => i);
 const round = (n, digits = 2) => Number(n.toFixed(digits));
@@ -37,11 +47,15 @@ export const hardware = [
   ["storageCost", "新购存储节点", "万元/台", 0, 10000, 0.1],
   ["spineCost", "新购 Spine", "万元/台", 0, 10000, 0.1],
 ];
-export const capacity = (c) => ({
-  D01: c.domain01StoragePB,
-  D02: round(c.sharedPB + c.newNodes * c.nodePB),
-});
+export const capacity = (c) =>
+  c.model
+    ? objectCapacity(c.model)
+    : {
+        D01: c.domain01StoragePB,
+        D02: round(c.sharedPB + c.newNodes * c.nodePB),
+      };
 export function cost(c) {
+  if (c.model) return objectCost(c.model);
   const usesImportedD02 =
     c.connections && (c.connectionDomains ?? ["D01", "D02"]).includes("D02");
   const uplinkCount = usesImportedD02
@@ -68,6 +82,7 @@ export function cost(c) {
   };
 }
 export function topology(c, fault = false) {
+  if (c.model) return objectTopology(c.model, fault);
   const devices = [],
     links = [],
     endpoints = {},
@@ -177,6 +192,14 @@ export function topology(c, fault = false) {
   return { devices, links, endpoints, planes };
 }
 export function validate(c) {
+  if (c.model) {
+    try {
+      inspectModel(c.model);
+      return [];
+    } catch (error) {
+      return [error.message];
+    }
+  }
   const issues = [];
   for (const [key, label, , min, max, step] of hardware) {
     const value = c[key];
@@ -306,7 +329,7 @@ export function parseMatrix(raw, graph, duration) {
   if (!rows.length) throw Error("通信矩阵为空");
   if (rows.length > 2000) throw Error("Demo 支持最多 2,000 行通信记录");
   return rows.map((line, i) => {
-    const [t, src, dst, m, p, type = "业务读取"] = line
+    const [t, src, dst, m, p, type = "业务读取", attributed] = line
       .split(/[,\t](?=(?:[^"]*"[^"]*")*[^"]*$)/)
       .map((s) => s.trim().replace(/^"|"$/g, "").replaceAll('""', '"'));
     const time = Number(t),
@@ -317,7 +340,19 @@ export function parseMatrix(raw, graph, duration) {
     if (
       !a?.nodes ||
       !b?.nodes ||
-      a.plane !== b.plane ||
+      (!graph.objectModel && a.plane !== b.plane) ||
+      (graph.objectModel &&
+        a.kind === "S" &&
+        b.kind === "C" &&
+        !a.clusters.includes(b.plane)) ||
+      (graph.objectModel &&
+        a.kind === "C" &&
+        b.kind === "S" &&
+        !b.clusters.includes(a.plane)) ||
+      (attributed &&
+        (!Object.hasOwn(graph.planes, attributed) ||
+          (!(a.clusters ?? [a.plane]).includes(attributed) &&
+            !(b.clusters ?? [b.plane]).includes(attributed)))) ||
       src === dst ||
       !t ||
       !Number.isFinite(time) ||
@@ -333,7 +368,12 @@ export function parseMatrix(raw, graph, duration) {
           (i + 1) +
           " 条记录无效，请检查端点、发送时间、消息大小与并发",
       );
-    return { time, src, dst, mb, parallel, type, plane: a.plane };
+    const plane =
+      attributed ||
+      (graph.objectModel && a.kind === "S" && b.kind === "C"
+        ? b.plane
+        : a.plane);
+    return { time, src, dst, mb, parallel, type, plane };
   });
 }
 export function traffic(workload, graph, distribution) {
@@ -345,7 +385,7 @@ export function traffic(workload, graph, distribution) {
     throw Error("负载窗口须为 10–400 ms 的整数");
   if (workload.mode === "matrix")
     return parseMatrix(
-      normalizeMatrix(workload.matrix),
+      graph.objectModel ? workload.matrix : normalizeMatrix(workload.matrix),
       graph,
       workload.duration,
     );
@@ -389,7 +429,8 @@ export function traffic(workload, graph, distribution) {
       for (let i = 0; i < groups; i++) {
         const n = time * 97 + i * 31 + pIndex * 7;
         const compute = C[i % C.length];
-        const strategy = p.domain === "D01" ? "集中" : distribution;
+        const strategy =
+          graph.objectModel || p.domain === "D01" ? "集中" : distribution;
         const hot = strategy === "集中" && hash(n) < p.hotspot / 100;
         const hotSize = Math.max(1, Math.ceil(S.length * 0.13));
         const store =
@@ -433,25 +474,6 @@ export function traffic(workload, graph, distribution) {
     throw Error("业务画像生成的通信批次超过 20,000，请缩短窗口或增大发送间隔");
   return flows;
 }
-function route(graph, flow, index) {
-  const a = graph.endpoints[flow.src],
-    b = graph.endpoints[flow.dst];
-  const hops = [];
-  const append = (link, from) =>
-    hops.push({ key: link.id + (link.a === from ? ">" : "<"), link });
-  append(a.access, a.name);
-  if (a.leaf !== b.leaf) {
-    const spines = Object.keys(a.routes).filter(
-      (s) => !a.routes[s].down && b.routes[s] && !b.routes[s].down,
-    );
-    if (!spines.length) return null;
-    const spine = spines[index % spines.length];
-    append(a.routes[spine], a.leaf);
-    append(b.routes[spine], spine);
-  }
-  append(b.access, b.leaf);
-  return hops;
-}
 function percentile(rows, p) {
   if (!rows.length) return null;
   const sorted = [...rows].sort((a, b) => a.value - b.value);
@@ -459,8 +481,6 @@ function percentile(rows, p) {
   let sum = 0;
   return round(sorted.find((r) => (sum += r.weight) >= goal).value, 3);
 }
-const STEP = 0.5;
-const EPS = 1e-7;
 const LIMITS = [
   ["domain01PB", "D01 容量", "PB"],
   ["domain02PB", "D02 容量", "PB"],
@@ -474,7 +494,15 @@ const LIMITS = [
 export { LIMITS };
 function run(c, w, limits, fault, detail) {
   const graph = topology(c, fault);
-  const offered = traffic(w, graph, c.distribution);
+  const service = w.mode === "service" ? prepareService(w, graph) : null;
+  const offered = service?.flows ?? traffic(w, graph, c.distribution);
+  const duration = service?.duration ?? w.duration;
+  const cutoff = duration + (service ? 5000 : Math.min(400, duration * 3));
+  const step = service ? 1 : 0.5;
+  const samplePeriod = service ? 50 : step;
+  let sampleStart = 0,
+    sampleBytes = 0;
+  const sampleFinished = [];
   const pending = [],
     completed = [];
   let dropped = 0;
@@ -485,6 +513,7 @@ function run(c, w, limits, fault, detail) {
       {
         ...l,
         peak: 0,
+        samplePeak: 0,
         queue: 0,
         types: Object.create(null),
         sources: Object.create(null),
@@ -503,7 +532,7 @@ function run(c, w, limits, fault, detail) {
       [source, "read"],
       [dest, "write"],
     ].filter(([e]) => e.kind === "S");
-    const shards = Math.min(flow.parallel, 4, c.spines);
+    const shards = Math.min(flow.parallel, 4, graph.objectModel ? 4 : c.spines);
     for (let j = 0; j < shards; j++) {
       const parallel =
         Math.floor(flow.parallel / shards) +
@@ -516,19 +545,36 @@ function run(c, w, limits, fault, detail) {
       const req = hops.map((h) =>
         resource(
           h.key,
-          (h.link.gbps * STEP) / 8,
+          (h.link.gbps * step) / 8,
           1,
           linkStats.get(h.link.id),
           "network",
         ),
       );
+      if (graph.objectModel) {
+        for (const { to } of hops) {
+          const switchGbps = graph.switchBudgets.get(to);
+          if (switchGbps)
+            req.push(
+              resource(
+                "switch/" + to,
+                (switchGbps * step) / 8,
+                1,
+                null,
+                "network",
+              ),
+            );
+        }
+      }
       for (const [endpoint, direction] of storage) {
         req.push(
           resource(
             endpoint.name + direction,
-            (direction === "read" ? c.readGBps : c.writeGBps) *
+            (direction === "read"
+              ? (endpoint.profile?.readGBps ?? c.readGBps)
+              : (endpoint.profile?.writeGBps ?? c.writeGBps)) *
               endpoint.nodes *
-              STEP,
+              step,
             1,
             null,
             "storage",
@@ -537,7 +583,8 @@ function run(c, w, limits, fault, detail) {
         req.push(
           resource(
             endpoint.name + "ops",
-            (c.nodeIOPS * endpoint.nodes * STEP) / 1000,
+            ((endpoint.profile?.iops ?? c.nodeIOPS) * endpoint.nodes * step) /
+              1000,
             1 / flow.mb,
             null,
             "storage",
@@ -550,7 +597,13 @@ function run(c, w, limits, fault, detail) {
         req,
         storageOps: storage.length,
         remaining: flow.mb * parallel,
-        delay: storage.length * c.deviceMs + hops.length * 0.003,
+        delay:
+          storage.reduce(
+            (sum, [endpoint]) =>
+              sum + (endpoint.profile?.latencyMs ?? c.deviceMs),
+            0,
+          ) +
+          hops.length * 0.003,
       });
     }
   });
@@ -561,12 +614,11 @@ function run(c, w, limits, fault, detail) {
     last = 0,
     waiting = 0;
   const stepStats = new Map();
-  for (let t = 0; t < w.duration + Math.min(400, w.duration * 3); t += STEP) {
+  for (let t = 0; t < cutoff; t += step) {
     while (cursor < pending.length && pending[cursor].time <= t + EPS)
       active.push(pending[cursor++]);
-    if (!active.length && cursor === pending.length && t >= w.duration) break;
-    const budgets = new Map();
-    const rates = new Map();
+    if (!active.length && cursor === pending.length && t >= duration) break;
+    const { budgets, rates } = allocateFlows(active, resources);
     const pressure = new Map();
     if (detail) {
       for (const f of active)
@@ -577,42 +629,8 @@ function run(c, w, limits, fault, detail) {
               (pressure.get(r.stat.id) || 0) + f.remaining,
             );
     }
-    let unsettled = [...active];
-    // Progressive filling: every co-routed message receives the same increment until a path resource saturates.
-    while (unsettled.length) {
-      const weights = new Map();
-      let increment = Infinity;
-      for (const f of unsettled) {
-        increment = Math.min(
-          increment,
-          (f.remaining - (rates.get(f) || 0)) / f.parallel,
-        );
-        for (const r of f.req) {
-          weights.set(r.key, (weights.get(r.key) || 0) + f.parallel * r.coef);
-          if (!budgets.has(r.key))
-            budgets.set(r.key, resources.get(r.key).budget);
-        }
-      }
-      for (const [key, weight] of weights)
-        increment = Math.min(increment, budgets.get(key) / weight);
-      const constrained = new Set();
-      for (const [key, weight] of weights) {
-        const left = Math.max(0, budgets.get(key) - weight * increment);
-        budgets.set(key, left);
-        if (left < EPS) constrained.add(key);
-      }
-      unsettled = unsettled.filter((f) => {
-        const amount = (rates.get(f) || 0) + increment * f.parallel;
-        rates.set(f, amount);
-        return (
-          amount < f.remaining - EPS &&
-          !f.req.some((r) => constrained.has(r.key))
-        );
-      });
-    }
     let transferred = 0,
       queue = 0;
-    const finishedThisStep = [];
     const directionUse = new Map();
     for (let i = active.length - 1; i >= 0; i--) {
       const f = active[i],
@@ -636,7 +654,7 @@ function run(c, w, limits, fault, detail) {
           }
         }
       if (f.remaining <= EPS) {
-        const finish = t + STEP + f.delay;
+        const finish = t + step + f.delay;
         const row = {
           plane: f.plane,
           time: finish,
@@ -644,56 +662,62 @@ function run(c, w, limits, fault, detail) {
           weight: f.parallel,
           mb: f.mb * f.parallel,
           ops: f.parallel * f.storageOps,
+          request: f.request,
         };
         completed.push(row);
-        if (detail) finishedThisStep.push(row);
+        if (detail) sampleFinished.push(row);
         last = Math.max(last, finish);
         active.splice(i, 1);
       } else {
         for (const r of f.req) {
           if ((budgets.get(r.key) ?? 1) > EPS) continue;
           const kind = resources.get(r.key).kind;
-          stepStats.set(kind, (stepStats.get(kind) || 0) + f.parallel * STEP);
+          stepStats.set(kind, (stepStats.get(kind) || 0) + f.parallel * step);
         }
       }
     }
     waiting = Math.max(queue, waiting);
     for (const [key, amount] of directionUse) {
       const stat = linkStats.get(key.slice(0, -1));
-      stat.peak = Math.max(
-        stat.peak,
-        (100 * amount) / resources.get(key).budget,
-      );
+      const used = (100 * amount) / resources.get(key).budget;
+      stat.peak = Math.max(stat.peak, used);
+      stat.samplePeak = Math.max(stat.samplePeak, used);
     }
     if (detail) {
-      for (const stat of linkStats.values()) {
-        stat.queue = Math.max(stat.queue, pressure.get(stat.id) || 0);
-        stat.series.push(
-          round(
-            (100 *
-              Math.max(
-                directionUse.get(stat.id + ">") || 0,
-                directionUse.get(stat.id + "<") || 0,
-              )) /
-              ((stat.gbps * STEP) / 8 || 1),
-            1,
-          ),
-        );
+      for (const [id, bytes] of pressure) {
+        const stat = linkStats.get(id);
+        stat.queue = Math.max(stat.queue, bytes);
       }
-      series.push({
-        t: round(t + STEP),
-        rate: round(transferred / STEP),
-        queue: round(queue),
-        latency: percentile(finishedThisStep, 0.99),
-      });
+      sampleBytes += transferred;
+      if (t + step - sampleStart >= samplePeriod) {
+        for (const stat of linkStats.values()) {
+          stat.series.push(round(stat.samplePeak, 1));
+          stat.samplePeak = 0;
+        }
+        series.push({
+          t: round(t + step),
+          rate: round(sampleBytes / (t + step - sampleStart)),
+          queue: round(queue),
+          latency: percentile(sampleFinished, 0.99),
+        });
+        sampleStart = t + step;
+        sampleBytes = 0;
+        sampleFinished.length = 0;
+      }
     }
+  }
+  if (detail && !series.length) {
+    for (const stat of linkStats.values())
+      stat.series.push(round(stat.samplePeak, 1));
+    series.push({ t: round(duration), rate: 0, queue: 0, latency: null });
   }
   const unfinished =
     active.reduce((sum, f) => sum + f.parallel, 0) +
     pending.slice(cursor).reduce((sum, f) => sum + f.parallel, 0);
-  const span = Math.max(w.duration, last);
+  const span = Math.max(duration, last);
+  const capacities = graph.capacities ?? capacity(c);
   const domains = Object.fromEntries(
-    ["D01", "D02"].map((plane) => {
+    Object.keys(graph.planes).map((plane) => {
       const rows = completed.filter((f) => f.plane === plane);
       const requests = rows.reduce((sum, r) => sum + r.weight, 0);
       return [
@@ -705,7 +729,7 @@ function run(c, w, limits, fault, detail) {
           ),
           p95: percentile(rows, 0.95),
           p99: percentile(rows, 0.99),
-          capacity: capacity(c)[plane],
+          capacity: capacities[plane],
           requests,
         },
       ];
@@ -721,45 +745,120 @@ function run(c, w, limits, fault, detail) {
   });
   allLinks.sort((a, b) => b.peak - a.peak || b.queue - a.queue);
   const p99 = Math.max(...Object.values(domains).map((d) => d.p99 ?? 0));
-  const values = [
-    domains.D01.capacity,
-    domains.D02.capacity,
-    domains.D01.throughput,
-    domains.D02.throughput,
-    domains.D01.iops,
-    domains.D02.iops,
-    p99,
-    allLinks[0]?.peak ?? 0,
-  ];
-  const checks = LIMITS.map(([key, label, unit], i) => ({
+  const util = allLinks[0]?.peak ?? 0;
+  const serviceResult = service
+    ? finishService(
+        service,
+        completed.filter((row) => row.time <= cutoff),
+        cutoff,
+      )
+    : null;
+  const check = (key, label, unit, value, limit, max = false) => ({
     key,
     label,
     unit,
-    value: values[i],
-    limit: limits[key],
-    pass: i < 6 ? values[i] >= limits[key] : values[i] <= limits[key],
-  }));
-  checks.push({
-    key: "delivery",
-    label: "通信完成率",
-    unit: "%",
-    value: round(
-      100 *
-        (1 -
-          (unfinished + dropped) /
-            offered.reduce((sum, f) => sum + f.parallel, 0)),
-    ),
-    limit: 100,
-    pass: !unfinished && !dropped,
+    value,
+    limit,
+    max,
+    pass: max ? value <= limit : value >= limit,
   });
+  let networkChecks;
+  if (graph.objectModel) {
+    networkChecks = Object.entries(domains).flatMap(([id, values]) => {
+      const target = limits.clusters?.[id] ?? {};
+      const title = graph.clusterNames[id];
+      return [
+        ...(target.pb != null
+          ? [
+              check(
+                id + "/pb",
+                title + " 容量",
+                "PB",
+                values.capacity,
+                target.pb,
+              ),
+            ]
+          : []),
+        ...(target.gbps != null
+          ? [
+              check(
+                id + "/gbps",
+                title + " 有效吞吐",
+                "GB/s",
+                values.throughput,
+                target.gbps,
+              ),
+            ]
+          : []),
+        ...(target.iops != null
+          ? [
+              check(
+                id + "/iops",
+                title + " 完成 IOPS",
+                "IOPS",
+                values.iops,
+                target.iops,
+              ),
+            ]
+          : []),
+      ];
+    });
+    if (limits.p99 != null)
+      networkChecks.push(
+        check("p99", "最大 P99 消息时延", "ms", p99, limits.p99, true),
+      );
+    networkChecks.push(
+      check("util", "最大链路利用率", "%", util, limits.util ?? 100, true),
+    );
+  } else {
+    const values = [
+      domains.D01.capacity,
+      domains.D02.capacity,
+      domains.D01.throughput,
+      domains.D02.throughput,
+      domains.D01.iops,
+      domains.D02.iops,
+      p99,
+      util,
+    ];
+    networkChecks = LIMITS.filter(
+      ([key]) => !service || key.endsWith("PB") || key === "util",
+    ).map(([key, label, unit]) => {
+      const i = LIMITS.findIndex(([id]) => id === key);
+      return check(key, label, unit, values[i], limits[key], i >= 6);
+    });
+  }
+  const checks = [...networkChecks, ...(serviceResult?.checks ?? [])];
+  if (offered.length)
+    checks.push({
+      key: "delivery",
+      label: "通信完成率",
+      unit: "%",
+      value: round(
+        100 *
+          (1 -
+            (unfinished + dropped) /
+              offered.reduce((sum, f) => sum + f.parallel, 0)),
+      ),
+      limit: 100,
+      pass: !unfinished && !dropped,
+    });
   return {
     pass: checks.every((x) => x.pass),
     checks,
+    service: serviceResult,
+    objectModel: graph.objectModel ?? false,
+    networkNames: graph.networkNames,
     domains,
     p99,
     p95: percentile(completed, 0.95),
-    util: values[7],
-    throughput: round(domains.D01.throughput + domains.D02.throughput),
+    util,
+    throughput: round(
+      Object.values(domains).reduce(
+        (sum, domain) => sum + domain.throughput,
+        0,
+      ),
+    ),
     span: round(span),
     waiting: round(waiting),
     unfinished,
@@ -771,14 +870,29 @@ function run(c, w, limits, fault, detail) {
     flowCount: offered.reduce((s, f) => s + f.parallel, 0),
   };
 }
-export function simulate(c, w, limits, fault = false, detail = true) {
-  const issues = validate(c);
-  if (issues.length) throw Error(issues.slice(0, 3).join("；"));
+export function validateLimits(c, limits) {
+  const values = c.model
+    ? [
+        limits.util,
+        limits.p99,
+        ...Object.values(limits.clusters ?? {}).flatMap((row) => [
+          row.pb,
+          row.gbps,
+          row.iops,
+        ]),
+      ].filter((value) => value != null)
+    : LIMITS.map(([key]) => limits[key]);
   if (
-    LIMITS.some(([key]) => !Number.isFinite(limits[key]) || limits[key] < 0) ||
+    values.some((value) => !Number.isFinite(value) || value < 0) ||
     limits.util > 100
   )
     throw Error("性能约束必须为非负数，利用率不得超过 100%");
+}
+
+export function simulate(c, w, limits, fault = false, detail = true) {
+  const issues = validate(c);
+  if (issues.length) throw Error(issues.slice(0, 3).join("；"));
+  validateLimits(c, limits);
   return run(c, w, limits, fault, detail);
 }
 function numbers(raw, min, max) {
@@ -797,118 +911,327 @@ function numbers(raw, min, max) {
     throw Error("搜索范围须输入合法的逗号分隔整数");
   return [...new Set(parts.map(Number))];
 }
-export function optimize(c, w, limits, search, onProgress = () => {}) {
+export const NETWORK_DIMENSIONS = [
+  {
+    key: "uplinks",
+    field: "uplinks",
+    label: "每 Leaf 上联条数",
+    unit: "条",
+    min: 1,
+    max: 32,
+  },
+  {
+    key: "distributions",
+    field: "distribution",
+    label: "存储节点接入分布",
+    options: ["集中", "均衡"],
+  },
+  {
+    key: "newLeaves",
+    field: "newLeaves",
+    label: "新增存储 Leaf 数",
+    unit: "台",
+    min: 0,
+    max: 64,
+    optional: true,
+  },
+  {
+    key: "newNodes",
+    field: "newNodes",
+    label: "新增存储节点数",
+    unit: "台",
+    min: 0,
+    max: 1024,
+  },
+  {
+    key: "reuse",
+    field: "reuseLeaves",
+    label: "沿用存储 Leaf 数",
+    unit: "台",
+    min: 0,
+    max: 64,
+    inventory: true,
+  },
+];
+
+export function activeDimensions(config, search) {
+  return config.model
+    ? objectDimensions(config, search).filter((item) => item.enabled)
+    : NETWORK_DIMENSIONS.filter((dimension) =>
+        searchEnabled(search, config, dimension),
+      );
+}
+
+export function searchEnabled(search, config, dimension) {
+  return (
+    (!dimension.inventory || config.reuseInventory > 0) &&
+    (search.enabled?.[dimension.key] ?? !dimension.optional)
+  );
+}
+
+export function dimensionValues(config, search, dimension) {
+  const { key, field, min, max, options, label } = dimension;
+  if (!searchEnabled(search, config, dimension)) return [config[field]];
+  const raw = search[key] ?? config[field];
+  if (options) {
+    const values = [
+      ...new Set(
+        String(raw)
+          .split(/[,，]/)
+          .map((value) => value.trim()),
+      ),
+    ];
+    if (values.some((value) => !options.includes(value)))
+      throw Error(label + "只接受" + options.join("、"));
+    return values;
+  }
+  let upper = dimension.inventory ? Math.min(max, config.reuseInventory) : max;
+  if (field === "uplinks") {
+    const attached = new Map(
+      (config.attachments ?? []).map(({ endpoint, nodes }) => [
+        endpoint,
+        nodes,
+      ]),
+    );
+    const computePorts = Math.max(
+      0,
+      ...seq(Math.min(32, config.domain02Leaves)).map(
+        (index) =>
+          attached.get(id("D02", "C", index)) ?? config.computeNodesPerLeaf,
+      ),
+    );
+    upper = Math.min(max, config.leafPorts - computePorts);
+  }
+  if (upper < min) throw Error(label + "没有剩余物理端口");
+  try {
+    return numbers(raw, min, upper);
+  } catch {
+    throw Error(
+      label + "允许值须为 " + min + "–" + upper + " 的整数，以逗号分隔",
+    );
+  }
+}
+
+function candidates(config, search) {
+  let combinations = [{}];
+  for (const dimension of NETWORK_DIMENSIONS) {
+    const values = dimensionValues(config, search, dimension);
+    if (combinations.length * values.length > 160)
+      throw Error("单次评估最多 160 个组合，请缩小范围");
+    combinations = combinations.flatMap((change) =>
+      values.map((value) => ({ ...change, [dimension.field]: value })),
+    );
+  }
+  return combinations;
+}
+
+export function targetUplinkCounts(config) {
   if (
-    LIMITS.some(([key]) => !Number.isFinite(limits[key]) || limits[key] < 0) ||
-    limits.util > 100
+    !config.connections ||
+    !(config.connectionDomains ?? ["D01", "D02"]).includes("D02")
   )
-    throw Error("性能约束必须为非负数，利用率不得超过 100%");
-  const reuse = numbers(search.reuse, 0, 64),
-    nodes = numbers(search.newNodes, 0, 1024),
-    up = numbers(search.uplinks, 1, 32);
-  const distributions = [
-    ...new Set(search.distributions.split(/[,，]/).map((x) => x.trim())),
-  ];
-  if (distributions.some((x) => !["集中", "均衡"].includes(x)))
-    throw Error("接入分布只接受集中和均衡");
-  const total = reuse.length * nodes.length * up.length * distributions.length;
-  if (total > 160) throw Error("单次搜索最多 160 个组合，请缩小范围");
+    return [config.uplinks];
+  const counts = new Map();
+  for (const row of config.connections)
+    if (row.leaf.startsWith("D02-"))
+      counts.set(row.leaf, (counts.get(row.leaf) ?? 0) + row.ports);
+  const expected =
+    config.domain02Leaves + config.reuseLeaves + config.newLeaves;
+  if (counts.size < expected) counts.set("unconnected", 0);
+  return [...new Set(counts.values())].sort((a, b) => a - b);
+}
+
+function applyCandidate(base, change, compareUplinks) {
+  const uplinksChanged =
+    compareUplinks &&
+    (compareUplinks.length !== 1 || compareUplinks[0] !== change.uplinks);
+  const leavesChanged =
+    change.reuseLeaves !== base.reuseLeaves ||
+    change.newLeaves !== base.newLeaves;
+  const reattach =
+    leavesChanged ||
+    change.newNodes !== base.newNodes ||
+    change.distribution !== base.distribution;
+  const config = { ...base, ...change };
+  if (reattach) {
+    config.attachments = base.attachments?.filter(
+      (row) =>
+        row.endpoint.startsWith("D01-") || row.endpoint.startsWith("D02-C"),
+    );
+  }
+  const imported =
+    base.connections &&
+    (base.connectionDomains ?? ["D01", "D02"]).includes("D02");
+  if (imported && (uplinksChanged || leavesChanged)) {
+    const ports = topology({ ...config, connections: undefined }).links.filter(
+      (link) => link.plane === "D02" && link.type === "上联",
+    );
+    const present = new Set(ports.map((link) => link.a));
+    const retained = base.connections.filter(
+      (row) =>
+        row.leaf.startsWith("D01-") ||
+        (!uplinksChanged && present.has(row.leaf)),
+    );
+    const retainedLeaves = new Set(retained.map((row) => row.leaf));
+    config.connections = [
+      ...retained,
+      ...ports
+        .filter((link) => !retainedLeaves.has(link.a))
+        .map(({ a, b, ports }) => ({ leaf: a, spine: b, ports })),
+    ];
+  }
+  return config;
+}
+
+export const objectiveMetrics = (result) => ({
+  p99: result.service ? (result.service.p99 ?? Infinity) : result.p99,
+  throughput: result.service?.throughput ?? result.throughput,
+});
+
+export function optimize(
+  c,
+  w,
+  limits,
+  search,
+  onProgress = () => {},
+  options = {},
+) {
+  validateLimits(c, limits);
+  const hardwareInvalid =
+    !c.model &&
+    hardware.some(
+      ([key, , , min, max]) =>
+        !Number.isFinite(c[key]) || c[key] < min || c[key] > max,
+    );
+  if (hardwareInvalid) throw Error("请先修正资源配置中超出允许范围的字段");
+  const graphIssues = c.model ? validate(c) : [];
+  if (graphIssues.length) throw Error(graphIssues[0]);
+  const combinations = c.model
+    ? objectCandidates(c, search)
+    : candidates(c, search);
+  const total = combinations.length;
   const rows = [];
-  for (const r of reuse)
-    for (const n of nodes)
-      for (const u of up)
-        for (const distribution of distributions) {
-          const connections =
-            c.connections &&
-            (c.connectionDomains ?? ["D01", "D02"]).includes("D01")
-              ? c.connections.filter((row) => row.leaf.startsWith("D01-"))
-              : undefined;
-          const attachments = c.attachments?.filter((row) =>
-            row.endpoint.startsWith("D01-"),
+  const baseIssues = validate(c);
+  const requireFault = limits.fault || options.fault;
+  let baseline = options.baseline ?? null;
+  let baselineFault = options.baselineFault ?? null;
+  let baselineDetail = null;
+  function baselineRun(fault) {
+    try {
+      const detailed = !!options.detail && Boolean(options.fault) === fault;
+      const result = simulate(c, w, limits, fault, detailed);
+      if (detailed) baselineDetail = result;
+      const { links, series, ...summary } = result;
+      return summary;
+    } catch (error) {
+      baseIssues.push(error.message);
+      return null;
+    }
+  }
+  if (!baseIssues.length) {
+    baseline ??= baselineRun(false);
+    if (requireFault) baselineFault ??= baselineRun(true);
+  }
+  const capacityTargets = c.model
+    ? Object.fromEntries(
+        c.model.clusters.map(({ id }) => [id, limits.clusters?.[id]?.pb ?? 0]),
+      )
+    : { D01: limits.domain01PB, D02: limits.domain02PB };
+  const uplinkDimension = NETWORK_DIMENSIONS.find(
+    ({ key }) => key === "uplinks",
+  );
+  const compareUplinks =
+    !c.model && searchEnabled(search, c, uplinkDimension)
+      ? targetUplinkCounts(c)
+      : null;
+  for (const change of combinations) {
+    const config = c.model
+      ? change.config
+      : applyCandidate(c, change, compareUplinks);
+    const issues = validate(config);
+    const legal = !issues.length;
+    const cap = legal || !config.model ? capacity(config) : {};
+    if (legal)
+      for (const [cluster, target] of Object.entries(capacityTargets)) {
+        if (cap[cluster] < target)
+          issues.push(
+            cluster + " 容量缺口 " + round(target - cap[cluster]) + " PB",
           );
-          const config = {
-            ...c,
-            reuseLeaves: r,
-            newNodes: n,
-            uplinks: u,
-            distribution,
-            connections,
-            connectionDomains: connections ? ["D01"] : undefined,
-            attachments,
-          };
-          const cap = capacity(config);
-          const issues = validate(config);
-          const legal = !issues.length;
-          if (cap.D01 < limits.domain01PB)
-            issues.push(
-              "D01 容量缺口 " + round(limits.domain01PB - cap.D01) + " PB",
-            );
-          if (cap.D02 < limits.domain02PB)
-            issues.push(
-              "D02 容量缺口 " + round(limits.domain02PB - cap.D02) + " PB",
-            );
-          const row = {
-            id: "P" + String(rows.length + 1).padStart(3, "0"),
-            config,
-            cost: cost(config).total,
-            issues,
-            cap,
-            legal,
-          };
-          if (!issues.length) {
-            try {
-              const normal = simulate(config, w, limits, false, false);
-              const fault = limits.fault
-                ? simulate(config, w, limits, true, false)
-                : null;
-              row.result = normal;
-              row.fault = fault;
-              row.pass = normal.pass && (!fault || fault.pass);
-              row.margin = Math.min(
-                ...[normal, ...(fault ? [fault] : [])].flatMap((x) =>
-                  x.checks
-                    .filter((k) => k.limit && k.key !== "delivery")
-                    .map(
-                      (k) =>
-                        (["p99", "util"].includes(k.key)
-                          ? k.limit - k.value
-                          : k.value - k.limit) / k.limit,
-                    ),
-                ),
-              );
-            } catch (error) {
-              row.issues.push(error.message);
-            }
-          }
-          rows.push(row);
-          if (rows.length === total || rows.length % 3 === 0)
-            onProgress(rows.length, total, rows.filter((r) => r.pass).length);
-        }
+      }
+    const row = {
+      id: "P" + String(rows.length + 1).padStart(3, "0"),
+      ...(c.model ? { changes: change.changes } : { config }),
+      cost: legal || !config.model ? cost(config).total : null,
+      issues,
+      cap,
+      legal,
+    };
+    if (!issues.length) {
+      try {
+        const unchanged = c.model
+          ? !change.changes.length
+          : config.connections === c.connections &&
+            config.attachments === c.attachments &&
+            NETWORK_DIMENSIONS.every(({ field }) => config[field] === c[field]);
+        const normal =
+          unchanged && baseline
+            ? baseline
+            : simulate(config, w, limits, false, false);
+        const fault = requireFault
+          ? unchanged && baselineFault
+            ? baselineFault
+            : simulate(config, w, limits, true, false)
+          : null;
+        row.result = normal;
+        row.fault = fault;
+        row.pass = normal.pass && (!fault || fault.pass);
+        row.margin = Math.min(
+          ...[normal, ...(fault ? [fault] : [])].flatMap((x) =>
+            x.checks
+              .filter((k) => k.limit && k.key !== "delivery")
+              .map(
+                (k) =>
+                  (k.max || ["p99", "util"].includes(k.key)
+                    ? k.limit - k.value
+                    : k.value - k.limit) / k.limit,
+              ),
+          ),
+        );
+      } catch (error) {
+        row.issues.push(error.message);
+      }
+    }
+    rows.push(row);
+    if (rows.length === total || rows.length % 3 === 0)
+      onProgress(rows.length, total, rows.filter((r) => r.pass).length);
+  }
   const feasible = rows.filter((r) => r.pass);
+  const scores = new Map(
+    feasible.map((row) => [row.id, objectiveMetrics(row.result)]),
+  );
   for (const r of feasible)
     r.pareto = !feasible.some(
       (s) =>
         s.cost <= r.cost &&
-        s.result.throughput >= r.result.throughput &&
-        s.result.p99 <= r.result.p99 &&
+        scores.get(s.id).throughput >= scores.get(r.id).throughput &&
+        scores.get(s.id).p99 <= scores.get(r.id).p99 &&
         (s.cost < r.cost ||
-          s.result.throughput > r.result.throughput ||
-          s.result.p99 < r.result.p99),
+          scores.get(s.id).throughput > scores.get(r.id).throughput ||
+          scores.get(s.id).p99 < scores.get(r.id).p99),
     );
   feasible.sort(
     (a, b) =>
       (search.objective === "throughput"
-        ? b.result.throughput - a.result.throughput
+        ? scores.get(b.id).throughput - scores.get(a.id).throughput
         : search.objective === "margin"
           ? b.margin - a.margin
           : a.cost - b.cost) ||
       a.cost - b.cost ||
-      a.result.p99 - b.result.p99,
+      scores.get(a.id).p99 - scores.get(b.id).p99,
   );
   const legal = rows.filter((r) => r.legal);
   const capacityGap = Object.fromEntries(
-    ["D01", "D02"].map((plane) => {
-      const target = plane === "D01" ? limits.domain01PB : limits.domain02PB;
+    Object.entries(capacityTargets).map(([plane, target]) => {
       const best = legal.length
         ? Math.max(...legal.map((r) => r.cap[plane]))
         : null;
@@ -917,6 +1240,10 @@ export function optimize(c, w, limits, search, onProgress = () => {}) {
   );
   return {
     rows,
+    baseline,
+    baselineFault,
+    baselineDetail,
+    baseIssues,
     recommended: feasible[0]?.id || null,
     total,
     feasible: feasible.length,

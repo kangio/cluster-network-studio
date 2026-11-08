@@ -38,13 +38,20 @@ function normalizeKey(key) {
 export function normalizeNetworkData(value, field) {
   if (Array.isArray(value))
     return value.map((item) => normalizeNetworkData(item, field));
-  if (value && typeof value === "object")
+  if (value && typeof value === "object") {
+    if (
+      value.config?.model ||
+      value.model?.version === 1 ||
+      value.input?.config?.model
+    )
+      return value;
     return Object.fromEntries(
       Object.entries(value).map(([key, item]) => [
         normalizeKey(key),
         normalizeNetworkData(item, key),
       ]),
     );
+  }
   if (typeof value !== "string") return value;
   if (field === "domain" || field === "plane" || field === "connectionDomains")
     return normalizeDomain(value);

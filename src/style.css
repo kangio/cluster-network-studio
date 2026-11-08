@@ -1632,3 +1632,153 @@ progress {
   color: var(--muted);
   font-size: 11px;
 }
+
+.service-details {
+  margin-top: 10px;
+}
+.service-details summary {
+  cursor: pointer;
+  font-weight: 650;
+  color: #355c96;
+  padding: 6px 0;
+}
+.service-details > div {
+  margin-top: 8px;
+}
+.dimension-table .checkline {
+  margin: 0;
+}
+.dimension-table .field {
+  min-width: 135px;
+}
+.dimension-options {
+  margin-top: 12px;
+}
+
+.resource-parameter {
+  min-width: 0;
+}
+.resource-distribution {
+  margin-top: 12px;
+}
+.dimension-control {
+  display: grid;
+  gap: 6px;
+  margin-top: 5px;
+  padding: 5px 8px;
+  border-radius: 7px;
+  background: #f3f7fe;
+}
+.dimension-control .checkline {
+  margin: 0;
+  font-size: 11px;
+}
+.dimension-control .field > span {
+  font-size: 10px;
+}
+.dimension-error {
+  color: #9a481b;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.evaluation-scope {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 9px;
+  color: var(--muted);
+  font-size: 12px;
+  margin: -6px 0 15px;
+}
+.evaluation-scope > button {
+  margin-left: auto;
+}
+#evaluation-diagnostics {
+  scroll-margin-top: 80px;
+}
+
+.object-graph {
+  padding: 8px 16px 16px;
+}
+.object-graph svg {
+  display: block;
+  width: 100%;
+  max-height: 460px;
+  background: #f7faff;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+.object-graph text {
+  fill: #213752;
+  font-size: 12px;
+  font-weight: 650;
+}
+.object-graph .model-name {
+  fill: #526887;
+  font-size: 10px;
+  font-weight: 450;
+}
+.object-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 20px;
+  align-items: center;
+  margin-bottom: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.object-note {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 8px;
+}
+.object-dimensions {
+  display: flex;
+  gap: 12px;
+}
+.object-dimensions .checkline {
+  margin: 0;
+}
+.object-input {
+  width: 110px;
+  height: 30px;
+  margin-top: 4px;
+  border: 1px solid var(--line);
+  padding: 4px 6px;
+  border-radius: 6px;
+}
+.object-heat {
+  padding: 0 14px 14px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(85px, 1fr));
+  gap: 5px;
+  max-height: 245px;
+  overflow: auto;
+}
+.object-heat-cell {
+  height: auto;
+  min-height: 36px;
+  padding: 5px;
+  color: #21436b;
+  font-size: 10px;
+  text-align: left;
+}
+.object-heat-cell span,
+.object-heat-cell b {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.object-changes {
+  max-width: 410px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.object-editor {
+  width: min(900px, 96vw);
+}
+.object-editor textarea {
+  width: 100%;
+  max-height: 56vh;
+}
