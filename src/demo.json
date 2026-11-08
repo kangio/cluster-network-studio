@@ -1,0 +1,96 @@
+{
+  "id": "harbin",
+  "name": "哈尔滨移动 A2 → A5 存储利旧",
+  "kind": "存储网络改造",
+  "description": "保留 A2 业务服务能力，评估 A5 新建网络与存量存储设备复用的性能及建设成本。",
+  "config": {
+    "spines": 8,
+    "spinePorts": 96,
+    "uplinkGbps": 400,
+    "accessGbps": 200,
+    "domain01Leaves": 6,
+    "domain02Leaves": 8,
+    "computeNodesPerLeaf": 8,
+    "domain01StorageLeaves": 6,
+    "domain01StoragePB": 5,
+    "sharedPB": 2,
+    "reuseInventory": 20,
+    "reuseLeaves": 16,
+    "newLeaves": 0,
+    "uplinks": 8,
+    "leafPorts": 32,
+    "domain01Nodes": 48,
+    "sharedNodes": 24,
+    "newNodes": 24,
+    "nodePB": 0.25,
+    "distribution": "集中",
+    "readGBps": 36,
+    "writeGBps": 28,
+    "nodeIOPS": 26000,
+    "deviceMs": 0.18,
+    "leafCost": 18,
+    "reuseCost": 1.2,
+    "portCost": 0.25,
+    "storageCost": 28,
+    "spineCost": 32,
+    "domain01Uplinks": 8
+  },
+  "workload": {
+    "mode": "profile",
+    "duration": 60,
+    "profiles": [
+      {
+        "domain": "D01",
+        "model": "DeepSeek-V3",
+        "instances": 24,
+        "peak": 84,
+        "messageMB": 15,
+        "interval": 8,
+        "hotspot": 30,
+        "checkpoint": 24,
+        "loadShare": 25,
+        "readShare": 80
+      },
+      {
+        "domain": "D02",
+        "model": "DeepSeek-V4",
+        "instances": 48,
+        "peak": 140,
+        "messageMB": 21,
+        "interval": 6,
+        "hotspot": 76,
+        "checkpoint": 18,
+        "loadShare": 35,
+        "readShare": 76
+      }
+    ],
+    "matrix": "时间ms,源端点,目的端点,消息MB,并发,类型\n0,D01-C01,D01-S01,12,12,业务读取\n4,D02-C01,D02-S01,20,32,模型加载\n12,D02-C02,D02-S02,16,16,周期持久化"
+  },
+  "limits": {
+    "domain01PB": 5,
+    "domain02PB": 7,
+    "domain01GBps": 110,
+    "domain02GBps": 400,
+    "domain01IOPS": 7000,
+    "domain02IOPS": 18000,
+    "p99": 12,
+    "util": 100,
+    "fault": false
+  },
+  "search": {
+    "reuse": "8,12,16,20",
+    "newNodes": "16,20,24,28",
+    "uplinks": "4,8,12",
+    "distributions": "集中,均衡",
+    "objective": "cost"
+  },
+  "history": [],
+  "plans": [],
+  "display": {
+    "domains": {
+      "D01": "A2",
+      "D02": "A5"
+    },
+    "assigned": "利旧"
+  }
+}
