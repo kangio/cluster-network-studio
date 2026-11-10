@@ -8,8 +8,17 @@ export const OBJECT_SHEETS = {
   ports: "Ports",
   links: "Links",
   pools: "Pools",
+  groups: "Groups",
+  batchRules: "BatchRules",
 };
-const LISTS = new Set(["members", "clusters", "ratesGbps"]);
+const LISTS = new Set([
+  "members",
+  "clusters",
+  "ratesGbps",
+  "leafGroups",
+  "sourceGroups",
+  "targetGroups",
+]);
 const split = (value) =>
   String(value)
     .split(/[,，]/)

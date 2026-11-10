@@ -1,3 +1,10 @@
+import {
+  batchDimensions,
+  reconcileBatches,
+  validateBatchValue,
+  verifyBatchRules,
+} from "./topology-batch.js";
+
 const ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}$/;
 const KINDS = ["switch", "compute", "storage"];
 const present = (row) => row.enabled !== false;
@@ -10,6 +17,8 @@ const arrays = {
   ports: 12000,
   links: 6000,
   pools: 1000,
+  groups: 1000,
+  batchRules: 1000,
 };
 const sum = (items, value) =>
   items.reduce((total, item) => total + value(item), 0);
@@ -46,23 +55,34 @@ export function inspectModel(model) {
   const sections = {};
   for (const [key, max] of Object.entries(arrays)) {
     const rows =
-      model[key] ?? (["networks", "pools"].includes(key) ? [] : null);
+      model[key] ??
+      (["networks", "pools", "groups", "batchRules"].includes(key) ? [] : null);
     if (
       !Array.isArray(rows) ||
       rows.length > max ||
-      (["clusters", "models", "devices"].includes(key) && !rows.length)
+      (key === "clusters" && !rows.length)
     )
       throw Error(key + "须为对象数组，上限 " + max + " 条");
     sections[key] = index(rows, key);
   }
-  const { clusters, networks, models, devices, ports, links, pools } = sections;
+  const { clusters, networks, models, devices, ports, links, pools, groups } =
+    sections;
   for (const row of [
     ...clusters.values(),
     ...networks.values(),
     ...models.values(),
+    ...groups.values(),
   ])
     if (typeof row.name !== "string" || !row.name.trim())
       throw Error(row.id + "缺少名称");
+  for (const network of networks.values())
+    if (
+      network.maxHops !== undefined &&
+      (!Number.isInteger(network.maxHops) ||
+        network.maxHops < 1 ||
+        network.maxHops > 32)
+    )
+      throw Error(network.id + "的最大转发跳数无效");
   for (const model of models.values()) {
     if (
       !KINDS.includes(model.kind) ||
@@ -103,6 +123,7 @@ export function inspectModel(model) {
   for (const device of devices.values()) {
     deviceModels.set(device.id, reference(models, device.model, device.id));
     if (device.cluster != null) reference(clusters, device.cluster, device.id);
+    if (device.group != null) reference(groups, device.group, device.id);
     if (device.enabled !== undefined && typeof device.enabled !== "boolean")
       throw Error(device.id + "启用状态无效");
     if (
@@ -159,6 +180,7 @@ export function inspectModel(model) {
     if (a.device === b.device)
       throw Error(link.id + "不能连接同一台设备的端口");
     if (link.network != null) reference(networks, link.network, link.id);
+    if (link.group != null) reference(groups, link.group, link.id);
     if (link.enabled !== undefined && typeof link.enabled !== "boolean")
       throw Error(link.id + "启用状态无效");
     for (const key of ["cost", "upgradeCostPerGbps", "baselineGbps"])
@@ -193,6 +215,7 @@ export function inspectModel(model) {
     if (model.faultDevices.some((id) => deviceModels.get(id).kind !== "switch"))
       throw Error("故障场景只接受交换机编号");
   }
+  verifyBatchRules(model, devices, links, ports);
   return { ...sections, deviceModels, poolClusters };
 }
 
@@ -200,15 +223,18 @@ export function objectCapacity(model, inspected = inspectModel(model)) {
   return Object.fromEntries(
     [...inspected.clusters.keys()].map((cluster) => [
       cluster,
-      sum(
-        [...inspected.devices.values()].filter(
-          (device) =>
-            present(device) &&
-            inspected.deviceModels.get(device.id).kind === "storage" &&
-            inspected.poolClusters.get(device.id)?.has(cluster),
-        ),
-        (device) => inspected.deviceModels.get(device.id).capacityPB,
-      ),
+      Math.round(
+        1e12 *
+          sum(
+            [...inspected.devices.values()].filter(
+              (device) =>
+                present(device) &&
+                inspected.deviceModels.get(device.id).kind === "storage" &&
+                inspected.poolClusters.get(device.id)?.has(cluster),
+            ),
+            (device) => inspected.deviceModels.get(device.id).capacityPB,
+          ),
+      ) / 1e12,
     ]),
   );
 }
@@ -216,7 +242,10 @@ export function objectCapacity(model, inspected = inspectModel(model)) {
 export function objectCost(model) {
   const { devices, links, ports, deviceModels } = inspectModel(model);
   const lines = [...devices.values()]
-    .filter((device) => present(device) && device.state === "added")
+    .filter(
+      (device) =>
+        present(device) && ["added", "assigned"].includes(device.state),
+    )
     .map((device) => ({
       name: device.id,
       quantity: 1,
@@ -245,9 +274,15 @@ export function objectCost(model) {
 
 export function objectTopology(model, fault) {
   const data = inspectModel(model);
-  if (fault && !model.faultDevices?.length)
+  if (fault === true && !model.faultDevices?.length)
     throw Error("请在对象拓扑中配置故障交换机");
-  const failed = new Set(fault ? model.faultDevices : []);
+  const failed = new Set(
+    fault === true
+      ? model.faultDevices
+      : fault?.type === "device"
+        ? [fault.id]
+        : [],
+  );
   const planes = Object.fromEntries(
     [...data.clusters.keys()].map((id) => [id, { C: [], S: [] }]),
   );
@@ -260,6 +295,7 @@ export function objectTopology(model, fault) {
     devices.push({
       ...device,
       type: device.role || spec.kind,
+      kind: spec.kind,
       plane: device.cluster,
       ports: spec.portCount,
       modelName: spec.name,
@@ -294,7 +330,8 @@ export function objectTopology(model, fault) {
       !present(data.devices.get(a)) ||
       !present(data.devices.get(b)) ||
       failed.has(a) ||
-      failed.has(b);
+      failed.has(b) ||
+      (fault?.type === "link" && fault.id === row.id);
     const network = row.network ?? "fabric";
     const link = {
       id: row.id,
@@ -338,6 +375,12 @@ export function objectTopology(model, fault) {
     clusterNames: Object.fromEntries(
       [...data.clusters.values()].map(({ id, name }) => [id, name]),
     ),
+    groupNames: Object.fromEntries(
+      [...data.groups.values()].map(({ id, name }) => [id, name]),
+    ),
+    networkLimits: Object.fromEntries(
+      [...data.networks.values()].map(({ id, maxHops }) => [id, maxHops]),
+    ),
     networkNames: Object.fromEntries(
       [...data.networks.values()].map(({ id, name }) => [id, name]),
     ),
@@ -349,7 +392,7 @@ export function objectRoute(graph, { src, dst }, index) {
     return null;
   if (!graph.distances.has(dst)) {
     const paths = [];
-    for (const adjacency of graph.adjacencies.values()) {
+    for (const [network, adjacency] of graph.adjacencies) {
       if (!adjacency.has(dst)) continue;
       const distance = new Map([[dst, 0]]);
       const queue = [dst];
@@ -362,13 +405,20 @@ export function objectRoute(graph, { src, dst }, index) {
           queue.push(to);
         }
       }
-      paths.push({ adjacency, distance });
+      paths.push({
+        adjacency,
+        distance,
+        maxHops: graph.networkLimits[network] ?? Infinity,
+      });
     }
     graph.distances.set(dst, paths);
   }
   const reachable = graph.distances
     .get(dst)
-    .filter(({ distance }) => distance.has(src));
+    .filter(
+      ({ distance, maxHops }) =>
+        distance.has(src) && distance.get(src) <= maxHops,
+    );
   if (!reachable.length) return null;
   const length = Math.min(
     ...reachable.map(({ distance }) => distance.get(src)),
@@ -401,34 +451,53 @@ export function objectDimensions(config, search) {
       .filter((spec) => spec.kind === "compute")
       .map((spec) => spec.id),
   );
+  const countGroups = new Set(
+    (model.batchRules ?? [])
+      .filter(({ kind }) => kind === "device-count")
+      .map(({ group }) => group),
+  );
+  const managedLinks = new Set(
+    (model.batchRules ?? []).flatMap((rule) =>
+      rule.kind === "uplinks-per-leaf"
+        ? [rule.group]
+        : rule.kind === "attachment-distribution"
+          ? [rule.linkGroup]
+          : [],
+    ),
+  );
   const entries = [
     ...model.links.map((row) => ({
       row,
       collection: "links",
-      fields: ["gbps", "enabled"],
+      fields: managedLinks.has(row.group) ? ["gbps"] : ["gbps", "enabled"],
     })),
     ...model.devices
-      .filter((row) => !computeModels.has(row.model))
+      .filter(
+        (row) => !computeModels.has(row.model) && !countGroups.has(row.group),
+      )
       .map((row) => ({
         row,
         collection: "devices",
         fields: ["enabled"],
       })),
   ];
-  return entries.flatMap(({ row, collection, fields }) =>
-    fields.map((field) => {
-      const key = collection + "/" + row.id + "/" + field;
-      return {
-        key,
-        collection,
-        id: row.id,
-        field,
-        current: field === "enabled" ? present(row) : row.gbps,
-        enabled: search.object?.[key]?.enabled === true,
-        values: search.object?.[key]?.values,
-      };
-    }),
-  );
+  return [
+    ...batchDimensions(model, search),
+    ...entries.flatMap(({ row, collection, fields }) =>
+      fields.map((field) => {
+        const key = collection + "/" + row.id + "/" + field;
+        return {
+          key,
+          collection,
+          id: row.id,
+          field,
+          current: field === "enabled" ? present(row) : row.gbps,
+          enabled: search.object?.[key]?.enabled === true,
+          values: search.object?.[key]?.values,
+        };
+      }),
+    ),
+  ];
 }
 
 export function objectCandidates(config, search) {
@@ -442,19 +511,23 @@ export function objectCandidates(config, search) {
     const values = [
       ...new Set(
         raw.map((value) =>
-          dimension.field === "enabled"
-            ? { 启用: true, 停用: false, true: true, false: false }[value]
-            : value
-              ? Number(value)
-              : NaN,
+          dimension.kind === "attachment-distribution"
+            ? value
+            : dimension.field === "enabled"
+              ? { 启用: true, 停用: false, true: true, false: false }[value]
+              : value
+                ? Number(value)
+                : NaN,
         ),
       ),
     ];
     if (
       values.some((value) =>
-        dimension.field === "enabled"
-          ? typeof value !== "boolean"
-          : !number(value, 0.01),
+        dimension.collection === "batchRules"
+          ? !validateBatchValue(config.model, dimension, value)
+          : dimension.field === "enabled"
+            ? typeof value !== "boolean"
+            : !number(value, 0.01),
       )
     )
       throw Error(dimension.id + "候选值无效");
@@ -471,21 +544,25 @@ export function objectCandidates(config, search) {
                 id: dimension.id,
                 field: dimension.field,
                 current: dimension.current,
+                name: dimension.name,
                 value,
               },
             ],
       ),
     );
   }
-  return combinations.map((changes) => ({
-    config: applyObjectChanges(config, changes),
-    changes,
-  }));
+  return combinations.map((changes) => {
+    try {
+      return { config: applyObjectChanges(config, changes), changes };
+    } catch (error) {
+      return { config, changes, error: error.message };
+    }
+  });
 }
 
 export function applyObjectChanges(config, changes) {
   if (!changes?.length) return config;
-  const model = { ...config.model };
+  let model = { ...config.model };
   for (const collection of ["devices", "links"]) {
     const edits = changes.filter((change) => change.collection === collection);
     if (!edits.length) continue;
@@ -504,5 +581,9 @@ export function applyObjectChanges(config, changes) {
         ),
     );
   }
+  model = reconcileBatches(
+    model,
+    changes.filter((change) => change.collection === "batchRules"),
+  );
   return { ...config, model };
 }

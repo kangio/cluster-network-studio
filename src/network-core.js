@@ -6,6 +6,7 @@ export function route(graph, flow, index) {
   if (graph.objectModel) return objectRoute(graph, flow, index);
   const a = graph.endpoints[flow.src],
     b = graph.endpoints[flow.dst];
+  if (a.access.down || b.access.down) return null;
   const hops = [];
   const append = (link, from) =>
     hops.push({ key: link.id + (link.a === from ? ">" : "<"), link });

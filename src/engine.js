@@ -179,7 +179,7 @@ export function topology(c, fault = false) {
             ports,
             plane,
             type: "上联",
-            down: fault && spine === id(plane, "SP", 0),
+            down: fault === true && spine === id(plane, "SP", 0),
           };
           links.push(uplink);
           routes[spine] = uplink;
@@ -188,6 +188,13 @@ export function topology(c, fault = false) {
         if (nodes) groups[kind].push(name);
       });
     }
+  }
+  if (fault && typeof fault === "object") {
+    for (const link of links)
+      link.down =
+        fault.type === "link"
+          ? link.id === fault.id
+          : link.a === fault.id || link.b === fault.id;
   }
   return { devices, links, endpoints, planes };
 }
@@ -895,6 +902,65 @@ export function simulate(c, w, limits, fault = false, detail = true) {
   validateLimits(c, limits);
   return run(c, w, limits, fault, detail);
 }
+export const MAX_FAULT_TARGETS = 8;
+export const faultKey = (target) => target.type + "/" + target.id;
+
+export function faultTargets(config) {
+  const graph = topology(config);
+  const switches = graph.devices.filter(
+    (device) =>
+      device.enabled !== false &&
+      (!graph.objectModel || graph.switchBudgets.has(device.id)),
+  );
+  return [
+    ...switches.map((device) => ({
+      type: "device",
+      id: device.id,
+      label: device.id,
+    })),
+    ...graph.links
+      .filter((link) => !link.down && link.ports > 0)
+      .map((link) => ({
+        type: "link",
+        id: link.id,
+        ...(link.ports > 1 ? { parallelPorts: link.ports } : {}),
+        label:
+          (link.aPort ?? link.a) +
+          " ↔ " +
+          (link.bPort ?? link.b) +
+          (graph.objectModel ? " · " + link.id : ""),
+      })),
+  ];
+}
+
+export function evaluateFaults(config, workload, limits, targets = []) {
+  if (!targets.length) return [];
+  if (
+    targets.length > MAX_FAULT_TARGETS ||
+    new Set(targets.map(faultKey)).size !== targets.length
+  )
+    throw Error("一次最多校核 " + MAX_FAULT_TARGETS + " 个不同的故障对象");
+  const available = new Map(
+    faultTargets(config).map((target) => [faultKey(target), target]),
+  );
+  return targets.map((target) => {
+    const active = available.get(faultKey(target));
+    if (!active)
+      return {
+        target,
+        status: "not-applicable",
+        reason: "该对象在此方案中不存在或已停用",
+      };
+    const result = simulate(config, workload, limits, active, false);
+    const { links, series, ...summary } = result;
+    return {
+      target: active,
+      status: result.pass ? "passed" : "failed",
+      summary,
+    };
+  });
+}
+
 function numbers(raw, min, max) {
   const parts = String(raw)
     .split(/[,，]/)
@@ -1112,13 +1178,18 @@ export function optimize(
   const total = combinations.length;
   const rows = [];
   const baseIssues = validate(c);
-  const requireFault = limits.fault || options.fault;
+  const namedFaults = options.faults;
+  const requireFault =
+    namedFaults === undefined && (limits.fault || options.fault);
+  let baselineFaultResults = [];
   let baseline = options.baseline ?? null;
   let baselineFault = options.baselineFault ?? null;
   let baselineDetail = null;
   function baselineRun(fault) {
     try {
-      const detailed = !!options.detail && Boolean(options.fault) === fault;
+      const detailed =
+        !!options.detail &&
+        (namedFaults === undefined ? Boolean(options.fault) === fault : !fault);
       const result = simulate(c, w, limits, fault, detailed);
       if (detailed) baselineDetail = result;
       const { links, series, ...summary } = result;
@@ -1131,6 +1202,10 @@ export function optimize(
   if (!baseIssues.length) {
     baseline ??= baselineRun(false);
     if (requireFault) baselineFault ??= baselineRun(true);
+    if (namedFaults?.length && baseline)
+      baselineFaultResults =
+        options.baselineFaultResults ??
+        evaluateFaults(c, w, limits, namedFaults);
   }
   const capacityTargets = c.model
     ? Object.fromEntries(
@@ -1148,7 +1223,7 @@ export function optimize(
     const config = c.model
       ? change.config
       : applyCandidate(c, change, compareUplinks);
-    const issues = validate(config);
+    const issues = c.model && change.error ? [change.error] : validate(config);
     const legal = !issues.length;
     const cap = legal || !config.model ? capacity(config) : {};
     if (legal)
@@ -1182,11 +1257,26 @@ export function optimize(
             ? baselineFault
             : simulate(config, w, limits, true, false)
           : null;
+        const faultResults = namedFaults?.length
+          ? unchanged && baseline
+            ? baselineFaultResults
+            : evaluateFaults(config, w, limits, namedFaults)
+          : [];
         row.result = normal;
         row.fault = fault;
-        row.pass = normal.pass && (!fault || fault.pass);
+        row.faultResults = faultResults;
+        row.pass =
+          normal.pass &&
+          (!fault || fault.pass) &&
+          faultResults.every(({ status }) => status === "passed");
         row.margin = Math.min(
-          ...[normal, ...(fault ? [fault] : [])].flatMap((x) =>
+          ...[
+            normal,
+            ...(fault ? [fault] : []),
+            ...faultResults.flatMap(({ summary }) =>
+              summary ? [summary] : [],
+            ),
+          ].flatMap((x) =>
             x.checks
               .filter((k) => k.limit && k.key !== "delivery")
               .map(
@@ -1242,6 +1332,7 @@ export function optimize(
     rows,
     baseline,
     baselineFault,
+    baselineFaultResults,
     baselineDetail,
     baseIssues,
     recommended: feasible[0]?.id || null,

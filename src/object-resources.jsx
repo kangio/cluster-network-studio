@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useRef, useState } from "react";
 import {
   ArrowRight,
   Braces,
@@ -8,8 +8,16 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import { objectDimensions } from "./topology-model.js";
+import { objectDimensions, applyObjectChanges } from "./topology-model.js";
+import { validateBatchValue } from "./topology-batch.js";
 import { OBJECT_SHEETS, writeObjectWorkbook } from "./topology-io.js";
+import {
+  ObjectGraphView,
+  deviceGroupKey,
+  deviceGroupTitle,
+  topologyTiers,
+} from "./topology-view.jsx";
+import { TopologyInspector } from "./topology-inspector.jsx";
 
 const titles = {
   clusters: "集群",
@@ -20,146 +28,11 @@ const titles = {
   links: "链路",
   pools: "资源池",
 };
-const labels = { enabled: "启用状态", gbps: "链路速率" };
 const displayValue = (value) =>
   value === true ? "启用" : value === false ? "停用" : (value ?? "—");
 const visible = (row) => row.enabled !== false;
 
-export function ObjectGraphView({ graph }) {
-  const shown = graph.devices.filter(visible);
-  const switchCount = graph.switchBudgets.size;
-  const networkIds = [...new Set(graph.links.map((link) => link.network))];
-  const [filter, setFilter] = useState("");
-  const enabledLinks = graph.links.filter(
-    (link) => !link.down && (!filter || link.network === filter),
-  );
-  const included = new Set(enabledLinks.flatMap((link) => [link.a, link.b]));
-  const nodes = filter ? shown.filter((item) => included.has(item.id)) : shown;
-  const columns = [
-    nodes.filter((device) => graph.endpoints[device.id]?.kind === "C"),
-    nodes.filter((device) => graph.switchBudgets.has(device.id)),
-    nodes.filter((device) => graph.endpoints[device.id]?.kind === "S"),
-  ];
-  const height = Math.max(
-    110,
-    ...columns.map((group) => 32 + group.length * 49),
-  );
-  const positions = new Map(
-    columns.flatMap((group, index) =>
-      group.map((device, row) => [
-        device.id,
-        { x: 145 + index * 260, y: 34 + row * 49 },
-      ]),
-    ),
-  );
-  return (
-    <div className="object-graph">
-      <div className="object-summary">
-        <span>{Object.keys(graph.planes).length} 个集群</span>
-        <span>{switchCount} 台启用交换机</span>
-        <span>
-          {graph.links.filter((link) => !link.down).length} 条启用链路
-        </span>
-        {networkIds.length > 1 && (
-          <label>
-            网络{" "}
-            <select
-              aria-label="图中网络"
-              value={filter}
-              onChange={(event) => setFilter(event.target.value)}
-            >
-              <option value="">全部</option>
-              {networkIds.map((key) => (
-                <option key={key} value={key}>
-                  {graph.networkNames[key] ?? key}
-                </option>
-              ))}
-            </select>
-          </label>
-        )}
-      </div>
-      {nodes.length > 45 ? (
-        <p className="object-note">
-          当前视图设备较多，可在设备和链路清单中按编号筛选。
-        </p>
-      ) : (
-        <svg
-          viewBox={"0 0 810 " + height}
-          role="img"
-          aria-label="设备与实际连接拓扑"
-        >
-          {enabledLinks.map((link) => {
-            const a = positions.get(link.a),
-              b = positions.get(link.b);
-            if (!a || !b) return null;
-            const d =
-              a.x === b.x
-                ? "M " +
-                  a.x +
-                  " " +
-                  a.y +
-                  " C " +
-                  (a.x + 165) +
-                  " " +
-                  a.y +
-                  " " +
-                  (b.x + 165) +
-                  " " +
-                  b.y +
-                  " " +
-                  b.x +
-                  " " +
-                  b.y
-                : "M " + a.x + " " + a.y + " L " + b.x + " " + b.y;
-            return (
-              <path
-                key={link.id}
-                d={d}
-                fill="none"
-                stroke={link.type === "上联" ? "#4378da" : "#aabede"}
-                strokeWidth="2"
-              >
-                <title>
-                  {link.aPort} ↔ {link.bPort} · {link.gbps} Gbps
-                </title>
-              </path>
-            );
-          })}
-          {nodes.map((node) => {
-            const { x, y } = positions.get(node.id);
-            return (
-              <g key={node.id}>
-                <rect
-                  x={x - 100}
-                  y={y - 19}
-                  width="200"
-                  height="38"
-                  rx="8"
-                  fill="#fff"
-                  stroke="#c4d6f5"
-                />
-                <text x={x} y={y - 1} textAnchor="middle">
-                  {node.id.slice(0, 25)}
-                </text>
-                <text
-                  x={x}
-                  y={y + 12}
-                  textAnchor="middle"
-                  className="model-name"
-                >
-                  {node.modelName.slice(0, 24)}
-                </text>
-                <title>
-                  {node.id} · {node.modelName}
-                </title>
-              </g>
-            );
-          })}
-        </svg>
-      )}
-    </div>
-  );
-}
+export { ObjectGraphView };
 
 function objectColumns(section, graph, model) {
   const name = (key) => graph.clusterNames[key] ?? key ?? "共享";
@@ -241,6 +114,74 @@ function objectColumns(section, graph, model) {
   return profiles[section];
 }
 
+function GroupView({ graph, onSelect }) {
+  const groups = new Map();
+  const tiers = topologyTiers(graph);
+  for (const device of graph.devices) {
+    const key = deviceGroupKey(device, tiers.get(device.id));
+    const label =
+      graph.groupNames[device.group] ??
+      (graph.clusterNames[device.plane] ?? "共享") +
+        " · " +
+        deviceGroupTitle(graph, device, tiers.get(device.id));
+    if (!groups.has(key))
+      groups.set(key, { label, modelName: device.modelName, devices: [] });
+    groups.get(key).devices.push(device);
+  }
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <div>
+          <h2>设备分组清单</h2>
+          <p>异构设备按型号分别列出。选择分组可查看属性和规划规则。</p>
+        </div>
+      </div>
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>分组</th>
+              <th>型号</th>
+              <th>启用 / 库存</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {[...groups].map(([key, row]) => (
+              <tr key={key}>
+                <td>{row.label}</td>
+                <td>{row.modelName}</td>
+                <td>
+                  {row.devices.filter(visible).length} / {row.devices.length} 台
+                </td>
+                <td>
+                  <button
+                    type="button"
+                    className="text-button"
+                    onClick={() =>
+                      onSelect({
+                        type: "group",
+                        id: row.devices[0].id,
+                        ids: row.devices.map((device) => device.id),
+                        title: row.label,
+                      })
+                    }
+                  >
+                    查看属性 <ArrowRight size={13} />
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {!groups.size && (
+        <div className="panel-body object-note">请导入设备或编辑拓扑对象。</div>
+      )}
+    </section>
+  );
+}
+
 export function ObjectResources({
   project,
   graph,
@@ -252,7 +193,13 @@ export function ObjectResources({
   fileBusy,
   evaluate,
 }) {
-  const [section, setSection] = useState("devices");
+  const [section, setSection] = useState("groups");
+  const [inventoryIds, setInventoryIds] = useState(null);
+  const [selection, setSelection] = useState(null);
+  const [graphMode, setGraphMode] = useState("group");
+  const [focus, setFocus] = useState(null);
+  const workspace = useRef(null);
+  const inventory = useRef(null);
   const [query, setQuery] = useState("");
   const [page, setPage] = useState(0);
   const [draft, setDraft] = useState(null);
@@ -262,9 +209,10 @@ export function ObjectResources({
     () => objectDimensions(project.config, project.search),
     [project.config, project.search],
   );
-  const choices = dimensions.filter((item) => item.enabled).length;
-  const rows = (model[section] ?? []).filter((row) =>
-    JSON.stringify(row).toLowerCase().includes(query.toLowerCase()),
+  const rows = (model[section] ?? []).filter(
+    (row) =>
+      (!inventoryIds || inventoryIds.has(row.id)) &&
+      JSON.stringify(row).toLowerCase().includes(query.toLowerCase()),
   );
   const chunk = 50;
   const current = Math.min(
@@ -272,6 +220,44 @@ export function ObjectResources({
     Math.max(0, Math.ceil(rows.length / chunk) - 1),
   );
   const columns = objectColumns(section, graph, model);
+  function showInventory(section, ids) {
+    setInventoryIds(ids ? new Set(ids) : null);
+    setQuery("");
+    setPage(0);
+    setSection(section);
+    if (ids) inventory.current?.scrollIntoView({ block: "start" });
+  }
+  function pickInventory(next) {
+    setSelection(next);
+    workspace.current?.scrollIntoView({ block: "start" });
+  }
+  function drill(next) {
+    setFocus(next);
+    setGraphMode("device");
+  }
+  function updateBaseline(item, raw) {
+    try {
+      let value;
+      if (item.field === "enabled") value = raw === "启用";
+      else if (item.kind === "attachment-distribution") value = raw.trim();
+      else value = raw.trim() ? Number(raw) : NaN;
+      if (
+        item.collection === "batchRules" &&
+        !validateBatchValue(model, item, value)
+      )
+        throw Error(item.name + "超出分组范围");
+      if (item.field === "gbps" && (!Number.isFinite(value) || value <= 0))
+        throw Error("请输入大于零的链路速率");
+      const config = applyObjectChanges(project.config, [
+        { collection: item.collection, id: item.id, field: item.field, value },
+      ]);
+      adopt(config.model);
+      return true;
+    } catch (error) {
+      notify(error.message, "error");
+      return false;
+    }
+  }
   const editDimension = (item, change) =>
     patch({
       search: {
@@ -320,193 +306,196 @@ export function ObjectResources({
           </button>
         </div>
       </div>
-      <section className="panel">
-        <div className="panel-head">
-          <div>
-            <h2>
-              <Network size={17} />
-              网络拓扑
-            </h2>
-            <p>显示已启用的物理连接。型号规格和集群归属单独记录。</p>
-          </div>
-          <div className="actions">
-            <button
-              className="btn"
-              onClick={() =>
-                download(
-                  "对象拓扑.json",
-                  JSON.stringify(
-                    {
-                      model,
-                      workload: project.workload,
-                      limits: project.limits,
-                      search: project.search,
-                    },
-                    null,
-                    2,
-                  ),
-                  "application/json",
-                )
-              }
-            >
-              <Download size={15} />
-              导出 JSON
-            </button>
-            <button
-              className="btn"
-              onClick={async () => {
-                try {
-                  writeObjectWorkbook(
-                    await import("xlsx"),
-                    model,
-                    "对象拓扑.xlsx",
-                  );
-                } catch (e) {
-                  notify(e.message, "error");
+      <div className="topology-workspace" ref={workspace}>
+        <section className="panel topology-stage">
+          <div className="panel-head">
+            <div>
+              <h2>
+                <Network size={17} />
+                网络拓扑
+              </h2>
+              <p>
+                按 Spine、Leaf 和计算 / 存储节点分层。点选对象查看可调配置。
+              </p>
+            </div>
+            <div className="actions">
+              <button
+                className="btn"
+                onClick={() =>
+                  download(
+                    "对象拓扑.json",
+                    JSON.stringify(
+                      {
+                        model,
+                        workload: project.workload,
+                        limits: project.limits,
+                        search: project.search,
+                      },
+                      null,
+                      2,
+                    ),
+                    "application/json",
+                  )
                 }
-              }}
-            >
-              导出 Excel
-            </button>
+              >
+                <Download size={15} />
+                导出 JSON
+              </button>
+              <button
+                className="btn"
+                onClick={async () => {
+                  try {
+                    writeObjectWorkbook(
+                      await import("xlsx"),
+                      model,
+                      "对象拓扑.xlsx",
+                    );
+                  } catch (e) {
+                    notify(e.message, "error");
+                  }
+                }}
+              >
+                导出 Excel
+              </button>
+            </div>
           </div>
-        </div>
-        <ObjectGraphView graph={graph} />
-      </section>
-      <div className="module-tabs">
+          <ObjectGraphView
+            graph={graph}
+            mode={graphMode}
+            onMode={setGraphMode}
+            focus={focus}
+            clearFocus={() => setFocus(null)}
+            selection={selection}
+            onSelect={setSelection}
+          />
+        </section>
+        <TopologyInspector
+          key={selection ? selection.type + ":" + selection.id : "overview"}
+          graph={graph}
+          model={model}
+          dimensions={dimensions}
+          selection={selection}
+          onSelect={setSelection}
+          edit={editDimension}
+          update={updateBaseline}
+          drill={drill}
+          showInventory={showInventory}
+        />
+      </div>
+      <div className="module-tabs topology-inventory" ref={inventory}>
+        <button
+          className={section === "groups" ? "selected" : ""}
+          onClick={() => showInventory("groups")}
+        >
+          分组视图
+        </button>
         {Object.entries(titles).map(([key, title]) => (
           <button
             key={key}
             className={section === key ? "selected" : ""}
-            onClick={() => {
-              setSection(key);
-              setQuery("");
-              setPage(0);
-            }}
+            onClick={() => showInventory(key)}
           >
             {title} · {model[key]?.length ?? 0}
           </button>
         ))}
       </div>
-      <section className="panel">
-        <div className="panel-head">
-          <div>
-            <h2>{titles[section]}清单</h2>
-            <p>候选值独立于基线 · 已开放 {choices} 项</p>
-          </div>
-          <label className="search-box">
-            <input
-              aria-label="筛选拓扑对象"
-              placeholder="筛选编号或参数"
-              value={query}
-              onChange={(event) => {
-                setQuery(event.target.value);
-                setPage(0);
-              }}
-            />
-          </label>
-        </div>
-        <div className="table-wrap">
-          <table className="object-table">
-            <thead>
-              <tr>
-                {columns.map(([label]) => (
-                  <th key={label}>{label}</th>
-                ))}
-                {["links", "devices"].includes(section) && (
-                  <th>允许调整与候选值</th>
-                )}
-              </tr>
-            </thead>
-            <tbody>
-              {rows.slice(current * chunk, (current + 1) * chunk).map((row) => (
-                <tr key={row.id}>
-                  {columns.map(([label, get]) => (
-                    <td key={label}>{displayValue(get(row))}</td>
-                  ))}
-                  {["links", "devices"].includes(section) && (
-                    <td>
-                      <div className="object-dimensions">
-                        {dimensions
-                          .filter(
-                            (item) =>
-                              item.collection === section && item.id === row.id,
-                          )
-                          .map((item) => (
-                            <div key={item.key}>
-                              <label className="checkline">
-                                <input
-                                  type="checkbox"
-                                  aria-label={
-                                    "允许调整 " +
-                                    row.id +
-                                    " " +
-                                    labels[item.field]
-                                  }
-                                  checked={!!item.enabled}
-                                  onChange={(event) =>
-                                    editDimension(item, {
-                                      enabled: event.target.checked,
-                                    })
-                                  }
-                                />
-                                {labels[item.field]}
-                              </label>
-                              {item.enabled && (
-                                <input
-                                  className="object-input"
-                                  aria-label={
-                                    row.id + " " + labels[item.field] + "候选值"
-                                  }
-                                  value={
-                                    item.values ?? displayValue(item.current)
-                                  }
-                                  onChange={(event) =>
-                                    editDimension(item, {
-                                      values: event.target.value,
-                                    })
-                                  }
-                                  placeholder={
-                                    item.field === "enabled"
-                                      ? "启用,停用"
-                                      : "25,100"
-                                  }
-                                />
-                              )}
-                            </div>
-                          ))}
-                      </div>
-                    </td>
-                  )}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        {!rows.length && (
-          <div className="panel-body object-note">没有匹配的记录</div>
-        )}
-        {rows.length > chunk && (
-          <div className="panel-body actions">
-            <button
-              className="btn"
-              disabled={!current}
-              onClick={() => setPage(current - 1)}
-            >
-              上一页
-            </button>
-            <span>
-              {current + 1} / {Math.ceil(rows.length / chunk)}
-            </span>
-            <button
-              className="btn"
-              disabled={(current + 1) * chunk >= rows.length}
-              onClick={() => setPage(current + 1)}
-            >
-              下一页
-            </button>
-          </div>
-        )}
-      </section>
+      {section === "groups" ? (
+        <GroupView graph={graph} onSelect={pickInventory} />
+      ) : (
+        <>
+          <section className="panel">
+            <div className="panel-head">
+              <div>
+                <h2>{titles[section]}清单</h2>
+                <p>
+                  {inventoryIds
+                    ? "当前对象的关联记录"
+                    : "查看拓扑对象与连接信息"}
+                </p>
+              </div>
+              <label className="search-box">
+                <input
+                  aria-label="筛选拓扑对象"
+                  placeholder="筛选编号或参数"
+                  value={query}
+                  onChange={(event) => {
+                    setQuery(event.target.value);
+                    setPage(0);
+                  }}
+                />
+              </label>
+            </div>
+            <div className="table-wrap">
+              <table className="object-table">
+                <thead>
+                  <tr>
+                    {columns.map(([label]) => (
+                      <th key={label}>{label}</th>
+                    ))}
+                    {["links", "devices"].includes(section) && (
+                      <th>对象属性</th>
+                    )}
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows
+                    .slice(current * chunk, (current + 1) * chunk)
+                    .map((row) => (
+                      <tr key={row.id}>
+                        {columns.map(([label, get]) => (
+                          <td key={label}>{displayValue(get(row))}</td>
+                        ))}
+                        {["links", "devices"].includes(section) && (
+                          <td>
+                            <button
+                              type="button"
+                              className="text-button"
+                              aria-label={"查看属性 " + row.id}
+                              onClick={() =>
+                                pickInventory({
+                                  type: section === "links" ? "link" : "device",
+                                  id: row.id,
+                                  ids: [row.id],
+                                  title: row.id,
+                                })
+                              }
+                            >
+                              查看属性 <ArrowRight size={13} />
+                            </button>
+                          </td>
+                        )}
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            </div>
+            {!rows.length && (
+              <div className="panel-body object-note">没有匹配的记录</div>
+            )}
+            {rows.length > chunk && (
+              <div className="panel-body actions">
+                <button
+                  className="btn"
+                  disabled={!current}
+                  onClick={() => setPage(current - 1)}
+                >
+                  上一页
+                </button>
+                <span>
+                  {current + 1} / {Math.ceil(rows.length / chunk)}
+                </span>
+                <button
+                  className="btn"
+                  disabled={(current + 1) * chunk >= rows.length}
+                  onClick={() => setPage(current + 1)}
+                >
+                  下一页
+                </button>
+              </div>
+            )}
+          </section>
+        </>
+      )}
       {draft !== null && (
         <div className="modal-scrim" onClick={() => setDraft(null)}>
           <section

@@ -1700,23 +1700,10 @@ progress {
 .object-graph {
   padding: 8px 16px 16px;
 }
-.object-graph svg {
-  display: block;
-  width: 100%;
-  max-height: 460px;
-  background: #f7faff;
-  border: 1px solid var(--line);
-  border-radius: 9px;
-}
 .object-graph text {
   fill: #213752;
   font-size: 12px;
   font-weight: 650;
-}
-.object-graph .model-name {
-  fill: #526887;
-  font-size: 10px;
-  font-weight: 450;
 }
 .object-summary {
   display: flex;
@@ -1731,21 +1718,6 @@ progress {
   font-size: 12px;
   color: var(--muted);
   padding: 8px;
-}
-.object-dimensions {
-  display: flex;
-  gap: 12px;
-}
-.object-dimensions .checkline {
-  margin: 0;
-}
-.object-input {
-  width: 110px;
-  height: 30px;
-  margin-top: 4px;
-  border: 1px solid var(--line);
-  padding: 4px 6px;
-  border-radius: 6px;
 }
 .object-heat {
   padding: 0 14px 14px;
@@ -1781,4 +1753,235 @@ progress {
 .object-editor textarea {
   width: 100%;
   max-height: 56vh;
+}
+
+.fault-picker summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 15px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 650;
+}
+.fault-picker summary::before {
+  content: "›";
+  color: #52729e;
+  font-size: 16px;
+}
+.fault-picker[open] summary::before {
+  transform: rotate(90deg);
+}
+.fault-picker .search-box {
+  margin-top: 10px;
+  max-width: 300px;
+}
+.fault-picker .search-box input {
+  width: 100%;
+}
+.fault-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.fault-options {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 2px 12px;
+  max-height: 155px;
+  overflow: auto;
+  margin-block: 8px;
+}
+.fault-options .checkline {
+  margin: 0;
+  padding: 5px;
+  overflow-wrap: anywhere;
+}
+.fault-options small {
+  color: var(--muted);
+  white-space: nowrap;
+}
+.fault-reason {
+  display: block;
+  color: var(--muted);
+  white-space: normal;
+  max-width: 380px;
+  margin-top: 4px;
+}
+.model-picker {
+  display: grid;
+  gap: 6px;
+}
+.topology-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 312px;
+  gap: 14px;
+  scroll-margin-top: 72px;
+}
+.topology-stage { min-width: 0; }
+.topology-stage .panel-head { flex-wrap: wrap; }
+.topology-stage .panel-head .actions { margin-left: auto; }
+.topology-inventory { scroll-margin-top: 72px; }
+.topology-toolbar, .topology-focus, .topology-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 14px;
+}
+.topology-toolbar { margin-bottom: 12px; }
+.topology-toolbar .checkline { margin: 0; }
+.topology-filter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.topology-filter select, .inspector-baseline select, .inspector-baseline input {
+  min-width: 0;
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 0 8px;
+  background: #fff;
+  color: var(--ink);
+  font: inherit;
+}
+.topology-filter select { max-width: 200px; }
+.topology-focus {
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.topology-scroll {
+  overflow: auto;
+  max-height: min(65vh, 680px);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #f5f9ff;
+}
+.object-graph .topology-scroll svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.topology-band { stroke: #e0eaf6; fill: #f7faff; }
+.topology-band.band-leaf { stroke: #dcebe9; fill: #f4fbfa; }
+.topology-band.band-end { stroke: #e8e7f3; fill: #f9f8fc; }
+.topology-scroll .topology-network-title { font-size: 14px; font-weight: 750; }
+.topology-scroll .topology-band-title {
+  fill: #5a6e89;
+  font-size: 12px;
+  font-weight: 650;
+}
+.topology-scroll .topology-card-title { font-size: 12px; font-weight: 750; }
+.topology-scroll .topology-card-note { font-size: 10.5px; fill: #526887; font-weight: 500; }
+.topology-edge-line { stroke: #91a9ca; stroke-width: 1.35; }
+.topology-edge.selected .topology-edge-line,
+.topology-edge:hover .topology-edge-line,
+.topology-edge:focus-visible .topology-edge-line {
+  stroke: #2165df;
+  stroke-width: 2.6;
+}
+.topology-node[role="button"], .topology-edge[role="button"] { cursor: pointer; }
+.topology-node:focus, .topology-edge:focus-visible { outline: none; }
+.topology-node:hover > rect:first-of-type {
+  stroke: #6798df;
+}
+.topology-node:focus-visible > rect:first-of-type {
+  stroke: #2165df;
+  stroke-dasharray: 3 2;
+}
+.topology-foot { margin-top: 10px; font-size: 11px; color: var(--muted); }
+.topology-foot span:last-child { margin-left: auto; }
+.topology-inspector { height: 0; min-height: 100%; overflow: auto; }
+.topology-inspector .panel-head { gap: 8px; }
+.topology-inspector .panel-head .text-button { white-space: nowrap; }
+.inspector-body { padding: 0 14px 14px; }
+.inspector-object { display: flex; gap: 10px; align-items: center; margin: 2px 0 10px; }
+.inspector-object > div:last-child { min-width: 0; }
+.inspector-object h3 { font-size: 15px; margin: 3px 0 0; overflow-wrap: anywhere; }
+.inspector-object .muted, .inspector-hint { font-size: 12px; }
+.inspector-icon {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 8px;
+  background: #eaf2ff;
+  color: #235ed0;
+}
+.inspector-spec {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 5px 13px;
+  padding: 9px 10px;
+  margin: 0 0 10px;
+  border-radius: 7px;
+  background: #f5f8fc;
+  font-size: 12px;
+}
+.inspector-spec dt { color: var(--muted); }
+.inspector-spec dd { margin: 0; overflow-wrap: anywhere; }
+.inspector-tabs { margin: 12px 0 0; }
+.inspector-rules, .inspector-link-list { display: grid; gap: 8px; margin-top: 10px; }
+.inspector-section-title { font-size: 12px; font-weight: 700; color: var(--muted); }
+.inspector-dimension {
+  min-width: 0;
+  display: grid;
+  gap: 7px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfdff;
+}
+.dimension-title { display: flex; align-items: center; gap: 7px; font-size: 12px; }
+.dimension-title .badge { margin-left: auto; white-space: nowrap; font-size: 10px; }
+.dimension-scope { font-size: 11px; color: var(--muted); }
+.inspector-baseline { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.inspector-baseline input, .inspector-baseline select { flex: 1; width: 100%; }
+.inspector-baseline .btn { min-height: 32px; padding: 5px 7px; white-space: nowrap; font-size: 11px; }
+.inspector-toggle {
+  position: relative;
+  display: flex;
+  width: fit-content;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.inspector-toggle input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.toggle-track { width: 29px; height: 16px; border-radius: 12px; background: #778ca7; padding: 2px; }
+.toggle-track::before { content: ""; display: block; width: 12px; height: 12px; border-radius: 50%; background: #fff; }
+.inspector-toggle input:checked + .toggle-track { background: #2464dc; }
+.inspector-toggle input:checked + .toggle-track::before { transform: translateX(13px); }
+.inspector-toggle input:focus-visible + .toggle-track { outline: 2px solid #2464dc; outline-offset: 2px; }
+.inspector-candidates { margin: 0; }
+.inspector-candidates input { width: 100%; min-width: 0; border: 1px solid var(--line); border-radius: 7px; background: #fff; }
+.inspector-empty { color: var(--muted); padding: 8px 0; font-size: 12px; }
+.inspector-link {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 7px;
+  padding: 7px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.inspector-link:hover { border-color: #7fafe9; }
+.inspector-link b, .inspector-link small { display: block; overflow-wrap: anywhere; }
+.inspector-link small { color: var(--muted); }
+@media (max-width: 1100px) {
+  .topology-workspace { grid-template-columns: minmax(0, 1fr) 280px; }
+}
+@media (max-width: 900px) {
+  .topology-workspace { grid-template-columns: minmax(0, 1fr); }
+  .topology-inspector { height: auto; min-height: 0; max-height: 570px; }
 }

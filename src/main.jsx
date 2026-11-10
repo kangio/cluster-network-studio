@@ -52,12 +52,12 @@ import {
   capacity,
   clone,
   cost,
-  hardware,
   LIMITS,
   NETWORK_DIMENSIONS,
-  searchEnabled,
-  dimensionValues,
   activeDimensions,
+  faultKey,
+  faultTargets,
+  MAX_FAULT_TARGETS,
   validateLimits,
   targetUplinkCounts,
   topology,
@@ -72,7 +72,8 @@ import {
   ObjectHeatmap,
 } from "./object-resources.jsx";
 import { inspectModel, applyObjectChanges } from "./topology-model.js";
-import { readObjectWorkbook, singleClusterBundle } from "./topology-io.js";
+import { readObjectWorkbook } from "./topology-io.js";
+import { migrateClos, newTopologyProject } from "./clos-template.js";
 import "./style.css";
 
 const MODULES = [
@@ -107,34 +108,12 @@ const snapshot = (p, config = p.config) => ({
   limits: clone(p.limits),
 });
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const withoutFaults = ({ faults, ...input }) => input;
 const colors = ["#2866ed", "#12a795", "#eea03c", "#835ce7", "#ee696f"];
 const DEFAULT_DISPLAY = {
   domains: { D01: "网络域 01", D02: "网络域 02" },
   assigned: "沿用",
 };
-function readDisplay(value, current) {
-  if (value === undefined) return null;
-  if (!value || typeof value !== "object" || Array.isArray(value))
-    throw Error("展示配置须为对象");
-  const domains = Object.fromEntries(
-    Object.keys(current.domains).map((id) => {
-      const name = value.domains?.[id] ?? current.domains[id];
-      if (typeof name !== "string" || !name.trim() || name.trim().length > 24)
-        throw Error("网络域名称须为 1–24 个字符");
-      return [id, name.trim()];
-    }),
-  );
-  if (new Set(Object.values(domains)).size !== Object.keys(domains).length)
-    throw Error("请使用不同的网络域名称");
-  const assigned = value.assigned ?? current.assigned;
-  if (
-    typeof assigned !== "string" ||
-    !assigned.trim() ||
-    assigned.trim().length > 12
-  )
-    throw Error("设备状态标签须为 1–12 个字符");
-  return { domains, assigned: assigned.trim() };
-}
 const ROLE_STYLE = { existing: "gray", assigned: "teal", added: "blue" };
 const DisplayContext = createContext(DEFAULT_DISPLAY);
 function useProjectNames() {
@@ -172,7 +151,7 @@ function restoreProject(p) {
   }
   const old = (item) => item.input?.workload.mode === "inference";
   const archived = [...p.history.filter(old), ...p.plans.filter(old)];
-  return {
+  const restored = {
     ...p,
     workload,
     display,
@@ -182,6 +161,16 @@ function restoreProject(p) {
       ? { archivedInference: [...(p.archivedInference ?? []), ...archived] }
       : {}),
   };
+  if (restored.config.model) return restored;
+  try {
+    const existingErrors = validate(restored.config);
+    if (existingErrors.length) throw Error(existingErrors[0]);
+    const migrated = migrateClos(restored);
+    inspectModel(migrated.config.model);
+    return migrated;
+  } catch (error) {
+    return { ...restored, migrationIssue: error.message };
+  }
 }
 function load() {
   try {
@@ -191,7 +180,7 @@ function load() {
       const projects = d.projects
         .filter((p) => p.id !== "pd-inference")
         .map(restoreProject);
-      if (!projects.length) projects.push(clone(seed));
+      if (!projects.length) projects.push(restoreProject(clone(seed)));
       return {
         ...d,
         projects,
@@ -202,7 +191,7 @@ function load() {
       };
     }
   } catch {}
-  return { projects: [clone(seed)], active: seed.id };
+  return { projects: [restoreProject(clone(seed))], active: seed.id };
 }
 function download(filename, data, mime = "text/plain") {
   const url = URL.createObjectURL(
@@ -908,6 +897,185 @@ function Diagnostics({ result, onPick, comparison }) {
   );
 }
 
+const faultsOf = (input) => input?.faults ?? [];
+const faultStatus = {
+  passed: "通过",
+  failed: "未通过",
+  "not-applicable": "不适用",
+};
+
+function FaultPicker({ config, selected, onChange }) {
+  const [filter, setFilter] = useState("");
+  const options = useMemo(() => {
+    try {
+      return validate(config).length ? [] : faultTargets(config);
+    } catch {
+      return [];
+    }
+  }, [config]);
+  const keys = new Set(selected.map(faultKey));
+  const available = new Set(options.map(faultKey));
+  const matches = options.filter((option) =>
+    (option.label + option.id)
+      .toLowerCase()
+      .includes(filter.trim().toLowerCase()),
+  );
+  return (
+    <details className="fault-picker panel">
+      <summary>
+        <ShieldCheck size={16} /> 故障校核{" "}
+        <Badge tone={selected.length ? "blue" : "gray"}>
+          {selected.length
+            ? "已选 " + selected.length + " 项"
+            : "可选 · 仅正常评估"}
+        </Badge>
+      </summary>
+      <div className="panel-body">
+        <p className="muted">
+          始终评估正常组网。所选交换机或链路逐个下线，候选须通过每项校核。
+        </p>
+        <label className="search-box">
+          <Search size={15} />
+          <input
+            aria-label="搜索故障对象"
+            placeholder="输入设备或端口编号"
+            value={filter}
+            onChange={(event) => setFilter(event.target.value)}
+          />
+        </label>
+        {!!selected.length && (
+          <div className="fault-chips">
+            {selected.map((target) => (
+              <button
+                key={faultKey(target)}
+                className="btn"
+                type="button"
+                onClick={() =>
+                  onChange(
+                    selected.filter(
+                      (item) => faultKey(item) !== faultKey(target),
+                    ),
+                  )
+                }
+              >
+                {target.label}{" "}
+                {available.has(faultKey(target)) ? "" : "（已不可用）"}{" "}
+                <X size={13} />
+              </button>
+            ))}
+          </div>
+        )}
+        <div className="fault-options">
+          {matches.length ? (
+            matches.slice(0, 80).map((option) => (
+              <label className="checkline" key={faultKey(option)}>
+                <input
+                  type="checkbox"
+                  aria-label={"校核 " + option.label}
+                  checked={keys.has(faultKey(option))}
+                  disabled={
+                    selected.length >= MAX_FAULT_TARGETS &&
+                    !keys.has(faultKey(option))
+                  }
+                  onChange={(event) =>
+                    onChange(
+                      event.target.checked
+                        ? [...selected, option]
+                        : selected.filter(
+                            (item) => faultKey(item) !== faultKey(option),
+                          ),
+                    )
+                  }
+                />
+                <span>{option.label}</span>
+                <small>
+                  {option.type === "device"
+                    ? "交换机"
+                    : option.parallelPorts
+                      ? option.parallelPorts + " 条并联链路"
+                      : "链路"}
+                </small>
+              </label>
+            ))
+          ) : (
+            <p className="muted">没有匹配的启用对象。</p>
+          )}
+        </div>
+        <small className="muted">
+          {matches.length > 80 && "仅显示前 80 项，可按编号继续筛选。"}
+          单次最多选择 {MAX_FAULT_TARGETS} 项。
+        </small>
+      </div>
+    </details>
+  );
+}
+
+function FaultResults({ results, normal }) {
+  if (!results?.length) return null;
+  const delay = (value) => (normal?.service ? value?.service?.p99 : value?.p99);
+  const rate = (value) =>
+    normal?.service ? value?.service?.throughput : value?.throughput;
+  const compare = (from, to, unit) =>
+    to == null ? "—" : format(from, 2) + " → " + format(to, 2) + " " + unit;
+  return (
+    <Panel
+      title="逐项故障校核"
+      sub="每行仅下线一个对象。参数模板中的并联链路组按整组下线。"
+    >
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>下线对象</th>
+              <th>
+                {normal?.service ? "最差服务 P99 首 token" : "P99 消息完成"}
+              </th>
+              <th>吞吐</th>
+              <th>无路径消息</th>
+              <th>校核</th>
+            </tr>
+          </thead>
+          <tbody>
+            {results.map(({ target, status, summary, reason }) => (
+              <tr key={faultKey(target)}>
+                <td>
+                  {target.label ?? target.id}
+                  {target.parallelPorts
+                    ? " · " + target.parallelPorts + " 条并联"
+                    : ""}
+                </td>
+                <td>{compare(delay(normal), delay(summary), "ms")}</td>
+                <td>
+                  {compare(
+                    rate(normal),
+                    rate(summary),
+                    normal?.service ? "请求/s" : "GB/s",
+                  )}
+                </td>
+                <td>{summary ? format(summary.dropped, 0) : "—"}</td>
+                <td>
+                  <Status pass={status === "passed"}>
+                    {faultStatus[status]}
+                  </Status>
+                  {reason && <small className="fault-reason">{reason}</small>}
+                  {status === "failed" && summary && (
+                    <small className="fault-reason">
+                      {summary.checks
+                        .filter((check) => !check.pass)
+                        .map((check) => check.label)
+                        .join("、")}
+                    </small>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Panel>
+  );
+}
+
 function SimPage({
   project,
   run,
@@ -915,8 +1083,8 @@ function SimPage({
   result,
   plan,
   setPlan,
-  fault,
-  setFault,
+  selectedFaults,
+  setSelectedFaults,
   details,
   setDetails,
   openHistory,
@@ -935,12 +1103,14 @@ function SimPage({
   const selected = selectedPlan;
   const config = selected?.input.config ?? project.config;
   const dimensions = activeDimensions(project.config, project.search);
-  const faultName = config.model
-    ? config.model.faultDevices?.join("、")
-    : "SP01";
   const searching = !selected && dimensions.length > 0;
   const stale =
-    result && !same(result.input, selected?.input ?? snapshot(project));
+    result &&
+    (!same(
+      withoutFaults(result.input),
+      selected?.input ? withoutFaults(selected.input) : snapshot(project),
+    ) ||
+      !same(faultsOf(result.input), selectedFaults));
   const prev = project.history.find(
     (x) => x.fault !== result?.fault && same(x.input, result?.input),
   );
@@ -988,29 +1158,25 @@ function SimPage({
             <div className="runbar-icon">
               <SlidersHorizontal size={19} />
             </div>
-            <Select
-              label="评估输入"
-              value={plan}
-              onChange={setPlan}
-              options={[
-                ["", "项目基线 · 当前配置"],
-                ...project.plans.map((p) => [p.id, p.name]),
-                ...(selected?.preview
-                  ? [[selected.id, selected.name + " · 诊断预览"]]
-                  : []),
-              ]}
-            />
-            <Select
-              label="运行场景"
-              value={fault ? "fault" : "normal"}
-              onChange={(v) => setFault(v === "fault")}
-              options={[
-                ["normal", "正常场景"],
-                ...(faultName
-                  ? [["fault", "故障场景 · " + faultName + " 下线"]]
-                  : []),
-              ]}
-            />
+            {project.plans.length || selected?.preview ? (
+              <Select
+                label="切换方案"
+                value={plan}
+                onChange={setPlan}
+                options={[
+                  ["", "当前组网"],
+                  ...project.plans.map((item) => [item.id, item.name]),
+                  ...(selected?.preview
+                    ? [[selected.id, selected.name + " · 诊断预览"]]
+                    : []),
+                ]}
+              />
+            ) : (
+              <div className="field">
+                <span>评估输入</span>
+                <div className="pill-field">当前组网</div>
+              </div>
+            )}
             {searching && (
               <Select
                 label="方案排序目标"
@@ -1056,10 +1222,15 @@ function SimPage({
               查看资源与可调配置 <ArrowRight size={14} />
             </button>
           </div>
+          <FaultPicker
+            config={config}
+            selected={selectedFaults}
+            onChange={setSelectedFaults}
+          />
           {results}
           {data ? (
             <>
-              {(stale || result.fault !== fault || result.plan !== plan) && (
+              {(stale || result.plan !== plan) && (
                 <div className="notice">
                   <TriangleAlert size={16} />{" "}
                   当前显示已评估的快照。点击「运行评估」应用所选输入。
@@ -1088,6 +1259,7 @@ function SimPage({
                 <ServiceMetrics service={data.service} names={names} />
               )}
               <Metrics result={data} />
+              <FaultResults results={result.faultResults} normal={data} />
               {result.partial ? (
                 <Panel title="链路诊断">
                   <Empty
@@ -1319,6 +1491,35 @@ const profileFields = [
   ["loadShare", "启动阶段模型加载", "number", "%"],
   ["readShare", "常规读取占比", "number", "%"],
 ];
+const DEPLOYMENT_MODELS = ["DeepSeek-V3", "DeepSeek-V4", "Qwen3"];
+function ModelPicker({ value, onChange }) {
+  const [custom, setCustom] = useState(false);
+  const options = [
+    ...new Set([...DEPLOYMENT_MODELS, ...(value ? [value] : [])]),
+  ].map((model) => [model, model]);
+  return (
+    <div className="model-picker">
+      <Select
+        label="部署模型"
+        value={custom ? "" : value}
+        options={[...options, ["", "自定义模型…"]]}
+        onChange={(model) => {
+          setCustom(!model);
+          if (model) onChange(model);
+        }}
+      />
+      {(custom || !value) && (
+        <Field
+          label="自定义模型名称"
+          type="text"
+          value={value}
+          onChange={onChange}
+        />
+      )}
+    </div>
+  );
+}
+
 function ServiceLoad({ workload, update, names }) {
   const services = workload.services ?? [];
   const change = (index, patch) =>
@@ -1382,9 +1583,7 @@ function ServiceLoad({ workload, update, names }) {
                 options={Object.entries(names.display.domains)}
                 onChange={(domain) => change(index, { domain })}
               />
-              <Field
-                label="部署模型"
-                type="text"
+              <ModelPicker
                 value={item.model}
                 onChange={(model) => change(index, { model })}
               />
@@ -1847,37 +2046,11 @@ function WorkloadPage({ project, patch, notify }) {
               ))
             )}
           </div>
-          {(!project.config.model ||
-            project.config.model.faultDevices?.length > 0) && (
-            <label className="checkline">
-              <input
-                type="checkbox"
-                checked={!!limits.fault}
-                onChange={(e) =>
-                  patch({ limits: { ...limits, fault: e.target.checked } })
-                }
-              />{" "}
-              候选必须同时通过
-              {project.config.model ? "已配置的交换机故障" : " SP01 故障"}场景
-            </label>
-          )}
         </div>
       </Panel>
     </>
   );
 }
-const groups = [
-  [
-    "Clos 网络",
-    "spines spinePorts uplinkGbps accessGbps leafPorts domain01Uplinks uplinks domain01Leaves domain02Leaves computeNodesPerLeaf",
-  ],
-  [
-    "存量与新增资源",
-    "domain01StorageLeaves reuseInventory reuseLeaves newLeaves domain01Nodes sharedNodes newNodes domain01StoragePB sharedPB nodePB",
-  ],
-  ["存储性能画像", "readGBps writeGBps nodeIOPS deviceMs"],
-  ["设备与部署单价", "leafCost reuseCost portCost storageCost spineCost"],
-];
 function uplinkCountLabel(config) {
   const counts = targetUplinkCounts(config);
   return counts.length > 1
@@ -1885,103 +2058,6 @@ function uplinkCountLabel(config) {
     : String(counts[0] ?? 0);
 }
 
-function DimensionControl({ dimension, project, updateSearch }) {
-  if (
-    !dimension ||
-    !project ||
-    !updateSearch ||
-    (dimension.inventory && !project.config.reuseInventory)
-  )
-    return null;
-  const enabled = searchEnabled(project.search, project.config, dimension);
-  const label = dimension.label;
-  let error = null;
-  if (enabled) {
-    try {
-      dimensionValues(project.config, project.search, dimension);
-    } catch (issue) {
-      error = issue.message;
-    }
-  }
-  return (
-    <div className="dimension-control">
-      <label className="checkline">
-        <input
-          type="checkbox"
-          aria-label={"允许调整" + label}
-          checked={enabled}
-          onChange={(event) =>
-            updateSearch({
-              enabled: {
-                ...project.search.enabled,
-                [dimension.key]: event.target.checked,
-              },
-            })
-          }
-        />
-        允许调整
-      </label>
-      {enabled && (
-        <Field
-          label={label + "候选值"}
-          type="text"
-          value={
-            project.search[dimension.key] ?? project.config[dimension.field]
-          }
-          onChange={(value) => updateSearch({ [dimension.key]: value })}
-        />
-      )}
-      {error && (
-        <small className="dimension-error" role="alert">
-          {error}
-        </small>
-      )}
-    </div>
-  );
-}
-
-function ConfigFields({ config, update, keys, project, updateSearch }) {
-  const names = useProjectNames();
-  return (
-    <div className="form-grid three">
-      {hardware
-        .filter(([key]) => keys.includes(key))
-        .map(([key, label, unit, min, max, step]) => {
-          const dimension = NETWORK_DIMENSIONS.find(
-            (entry) => entry.field === key,
-          );
-          return (
-            <div
-              key={key}
-              className={
-                dimension && updateSearch ? "resource-parameter" : undefined
-              }
-            >
-              <Field
-                label={names.label(label)}
-                value={config[key]}
-                suffix={unit}
-                min={min}
-                max={max}
-                step={step}
-                onChange={(value) => update({ [key]: value })}
-              />
-              {key === "uplinks" && project?.config.connections && (
-                <small className="muted">
-                  实际上联 {uplinkCountLabel(config)} 条 / Leaf
-                </small>
-              )}
-              <DimensionControl
-                dimension={dimension}
-                project={project}
-                updateSearch={updateSearch}
-              />
-            </div>
-          );
-        })}
-    </div>
-  );
-}
 function TopologyView({ graph, capacities, domain, setDomain, onSelect }) {
   const names = useProjectNames();
   const devices = graph.devices.filter((device) => device.plane === domain);
@@ -2182,34 +2258,22 @@ function TopologyView({ graph, capacities, domain, setDomain, onSelect }) {
   );
 }
 function ResourcesPage({ project, patch, notify, evaluate }) {
-  const names = useProjectNames();
-  const [displayDraft, setDisplayDraft] = useState(null);
-  const [tab, setTab] = useState("拓扑工作台");
-  const [domain, setDomain] = useState("D02");
-  const [group, setGroup] = useState(groups[0][0]);
-  const [check, setCheck] = useState(false);
-  const [template, setTemplate] = useState(false);
   const [fileBusy, setFileBusy] = useState(false);
-  const { config } = project;
-  const updateSearch = (change) =>
-    patch({ search: { ...project.search, ...change } });
-  const enabledCount = NETWORK_DIMENSIONS.filter((dimension) =>
-    searchEnabled(project.search, config, dimension),
-  ).length;
-  const issues = useMemo(() => validate(config), [config]);
-  const graph = useMemo(
-    () => (issues.length ? null : topology(config)),
-    [config, issues],
-  );
-  const update = (diff) => {
-    patch({ config: { ...config, ...diff } });
-    setCheck(false);
-  };
+  const config = project.config;
+  const graph = useMemo(() => {
+    if (!config.model || validate(config).length) return null;
+    return topology(config);
+  }, [config]);
+
   function adopt(model, bundle = {}) {
     inspectModel(model);
     const next = { model };
     const topologyGraph = topology(next);
-    const current = project.config.model ? project.workload : null;
+    const hasLoad =
+      project.workload.services?.length ||
+      project.workload.profiles?.length ||
+      project.workload.matrix?.includes("\n");
+    const current = project.config.model && hasLoad ? project.workload : null;
     const defaultServices = Object.entries(topologyGraph.planes)
       .filter(([, endpoints]) => endpoints.C.length)
       .map(([domain, endpoints]) => ({
@@ -2224,181 +2288,126 @@ function ResourcesPage({ project, patch, notify, evaluate }) {
       }));
     const workload = bundle.workload ??
       current ?? {
-        ...project.workload,
         mode: "service",
+        duration: 60,
         seconds: 5,
         services: defaultServices,
-        profiles: defaultServices.map(({ domain, instances }) => ({
-          ...seed.workload.profiles[0],
-          domain,
-          instances,
-          model: "通信画像",
-        })),
+        profiles: [],
         matrix: "时间ms,源端点,目的端点,消息MB,并发,类型,集群",
       };
     const limits = bundle.limits ?? (current ? project.limits : { util: 100 });
     const search =
       bundle.search ??
-      (current ? project.search : { objective: "cost", object: {} });
-    const nextLimits = {
-      ...limits,
-      fault: !!(limits.fault && model.faultDevices?.length),
-    };
-    validateLimits(next, nextLimits);
-    patch({ config: next, workload, limits: nextLimits, search });
+      (project.config.model
+        ? project.search
+        : { objective: "cost", object: {} });
+    validateLimits(next, limits);
+    patch({
+      config: next,
+      workload,
+      limits,
+      search,
+      migrationIssue: undefined,
+      analysis: undefined,
+    });
     notify("对象拓扑已校验并保存");
   }
-  const importFile = async (e) => {
-    const file = e.target.files[0];
-    e.target.value = "";
+
+  function adoptLegacy(raw) {
+    const normalized = normalizeNetworkData(raw);
+    const values = normalized.config ?? normalized;
+    if (!values || typeof values !== "object")
+      throw Error("缺少旧版 Clos 资源配置");
+    const issues = validate(values);
+    if (issues.length) throw Error("旧版 Clos 配置需要完整参数：" + issues[0]);
+    const oldWorkload = normalized.workload ?? {
+      mode: "service",
+      seconds: 5,
+      duration: 60,
+      profiles: [],
+      matrix: "",
+      services: [serviceProfile("D01"), serviceProfile("D02")].map((item) => ({
+        ...item,
+        instances: 1,
+      })),
+    };
+    const converted = migrateClos({
+      config: values,
+      display: normalized.display ?? DEFAULT_DISPLAY,
+      workload: oldWorkload,
+      limits: normalized.limits ?? { util: 100 },
+      search: normalized.search ?? {
+        objective: "cost",
+        enabled: {
+          reuse: false,
+          newNodes: false,
+          newLeaves: false,
+          uplinks: false,
+          distributions: false,
+        },
+      },
+    });
+    adopt(converted.config.model, converted);
+  }
+
+  async function importFile(event) {
+    const file = event.target.files[0];
+    event.target.value = "";
     if (!file) return;
     setFileBusy(true);
     try {
-      let values;
-      let importedDisplay;
       if (/\.xlsx?$/i.test(file.name)) {
-        const x = await import("xlsx");
-        const b = x.read(await file.arrayBuffer(), { type: "array" });
+        const xlsx = await import("xlsx");
+        const book = xlsx.read(await file.arrayBuffer(), { type: "array" });
         if (
-          b.Sheets.Clusters ||
-          b.Sheets.Models ||
-          b.Sheets.Devices ||
-          b.Sheets.Ports
+          book.Sheets.Clusters ||
+          book.Sheets.Models ||
+          book.Sheets.Devices ||
+          book.Sheets.Ports
         ) {
-          adopt(readObjectWorkbook(x, b));
-          return;
-        }
-        const rows = x.utils.sheet_to_json(b.Sheets[b.SheetNames[0]], {
-          header: 1,
-          blankrows: false,
-        });
-        values = Object.fromEntries(
-          rows
-            .filter((r) => r.length >= 2 && r[0] !== "字段" && r[0] !== "key")
-            .map((r) => [String(r[0]).trim(), r[1]]),
-        );
-        if (b.Sheets.Links) {
-          values.connections = x.utils.sheet_to_json(b.Sheets.Links);
-          values.connectionDomains = ["D01", "D02"];
-        }
-        if (b.Sheets.Attachments)
-          values.attachments = x.utils.sheet_to_json(b.Sheets.Attachments);
-        if (b.Sheets.Display) {
-          const rows = x.utils.sheet_to_json(b.Sheets.Display);
-          const { assigned, ...domains } = Object.fromEntries(
-            rows.map(({ key, value }) => [key, value]),
+          adopt(readObjectWorkbook(xlsx, book));
+        } else {
+          const rows = xlsx.utils.sheet_to_json(
+            book.Sheets[book.SheetNames[0]],
+            { header: 1, blankrows: false },
           );
-          importedDisplay = { domains, assigned };
+          const old = Object.fromEntries(
+            rows
+              .filter(
+                (row) => row.length >= 2 && !["字段", "key"].includes(row[0]),
+              )
+              .map(([key, value]) => [String(key).trim(), value]),
+          );
+          if (book.Sheets.Links)
+            old.connections = xlsx.utils.sheet_to_json(book.Sheets.Links);
+          if (book.Sheets.Attachments)
+            old.attachments = xlsx.utils.sheet_to_json(book.Sheets.Attachments);
+          const display = book.Sheets.Display
+            ? Object.fromEntries(
+                xlsx.utils
+                  .sheet_to_json(book.Sheets.Display)
+                  .map(({ key, value }) => [key, value]),
+              )
+            : {};
+          const { assigned, ...domains } = display;
+          adoptLegacy({ config: old, display: { domains, assigned } });
         }
       } else {
-        const raw = JSON.parse(
-          await file.text().then((s) => s.replace(/^\uFEFF/, "")),
-        );
+        const raw = JSON.parse((await file.text()).replace(/^\uFEFF/, ""));
         const explicit =
           raw.model ??
           raw.config?.model ??
           (raw.version && raw.devices ? raw : null);
-        if (explicit) {
-          adopt(explicit, raw);
-          return;
-        }
-        values = raw.config ?? raw;
-        importedDisplay = raw.display;
+        if (explicit) adopt(explicit, raw);
+        else adoptLegacy(raw);
       }
-      if (config.model)
-        throw Error("此项目使用对象拓扑，请导入对象拓扑 JSON 或 Excel");
-      values = normalizeNetworkData(values);
-      const imported = readDisplay(
-        normalizeNetworkData(importedDisplay),
-        names.display,
-      );
-      const known = new Set([
-        ...hardware.map(([key]) => key),
-        "distribution",
-        "connections",
-        "connectionDomains",
-        "attachments",
-      ]);
-      const entries = Object.entries(values).filter(([key]) => known.has(key));
-      if (!entries.length && !imported)
-        throw Error("未识别到 Clos 配置字段，请下载导入样表");
-      const cfg = {
-        ...config,
-        ...("connections" in values ? { connectionDomains: undefined } : {}),
-        ...Object.fromEntries(
-          entries.map(([key, v]) => [
-            key,
-            [
-              "distribution",
-              "connections",
-              "connectionDomains",
-              "attachments",
-            ].includes(key)
-              ? v
-              : Number(v),
-          ]),
-        ),
-      };
-      const errors = validate(cfg);
-      if (errors.length) throw Error(errors.slice(0, 3).join("；"));
-      patch({ config: cfg, ...(imported ? { display: imported } : {}) });
-      setCheck(true);
-      notify("拓扑配置已导入并保存");
     } catch (error) {
       notify("导入失败：" + error.message, "error");
     } finally {
       setFileBusy(false);
     }
-  };
-  const exportWorkbook = async () => {
-    try {
-      const x = await import("xlsx");
-      const book = x.utils.book_new();
-      x.utils.book_append_sheet(
-        book,
-        x.utils.aoa_to_sheet([
-          ["key", "value"],
-          ...hardware.map(([key]) => [key, config[key]]),
-          ["distribution", config.distribution],
-        ]),
-        "Config",
-      );
-      if (graph) {
-        x.utils.book_append_sheet(
-          book,
-          x.utils.json_to_sheet(
-            graph.links
-              .filter((l) => l.type === "上联")
-              .map((l) => ({ leaf: l.a, spine: l.b, ports: l.ports })),
-          ),
-          "Links",
-        );
-        x.utils.book_append_sheet(
-          book,
-          x.utils.json_to_sheet(
-            Object.values(graph.endpoints).map((e) => ({
-              endpoint: e.name,
-              nodes: e.nodes,
-            })),
-          ),
-          "Attachments",
-        );
-      }
-      x.utils.book_append_sheet(
-        book,
-        x.utils.aoa_to_sheet([
-          ["key", "value"],
-          ...Object.entries(names.display.domains),
-          ["assigned", names.display.assigned],
-        ]),
-        "Display",
-      );
-      x.writeFile(book, "Clos-拓扑配置.xlsx");
-    } catch (e) {
-      notify(e.message, "error");
-    }
-  };
-  if (config.model && graph)
+  }
+  if (graph)
     return (
       <ObjectResources
         project={project}
@@ -2413,371 +2422,44 @@ function ResourcesPage({ project, patch, notify, evaluate }) {
       />
     );
   return (
-    <>
-      <Heading
-        tag="02 / NETWORK MODEL"
-        title="资源与网络建模"
-        description="编辑设备、端口和资源池，检查网络连接与物理容量。"
-        actions={
-          <>
-            <Btn onClick={evaluate}>
-              进入评估工作台 <ArrowRight size={15} />
-            </Btn>
-            <label className="btn">
-              <Upload size={16} />
-              {fileBusy ? "导入中…" : "批量导入"}
-              <input
-                type="file"
-                accept=".json,.xlsx,.xls"
-                onChange={importFile}
-                disabled={fileBusy}
-                hidden
-              />
-            </label>
-            <Btn
-              primary
-              icon={Check}
-              onClick={() => {
-                setCheck(true);
-                notify(
-                  issues.length ? "配置存在待修正项" : "拓扑配置已保存",
-                  issues.length ? "error" : undefined,
-                );
-              }}
-            >
-              校验并保存
-            </Btn>
-          </>
-        }
-      />
-      <div className="module-tabs">
-        {["拓扑工作台", "设备清单", "连接关系", "存储画像与成本"].map((t) => (
-          <button
-            className={tab === t ? "selected" : ""}
-            key={t}
-            onClick={() => setTab(t)}
-          >
-            {t}
-          </button>
-        ))}
-      </div>
-      {check && (
-        <div className={"notice " + (!issues.length ? "positive" : "")}>
-          {issues.length ? (
-            <TriangleAlert size={16} />
-          ) : (
-            <CheckCircle2 size={16} />
-          )}{" "}
-          {issues.length
-            ? names.label(issues.slice(0, 4).join("；"))
-            : "物理端口、资源池与 Clos 接入约束校验通过"}
-        </div>
-      )}
-      {tab === "拓扑工作台" && (
-        <div className="resource-grid">
-          <Panel
-            title="网络拓扑画布"
-            sub="按资源类型聚合 · 物理上联数来自当前连接模型"
-            action={
-              <div className="actions">
-                <Btn
-                  icon={Settings2}
-                  onClick={() => setDisplayDraft(clone(names.display))}
-                >
-                  展示设置
-                </Btn>
-                <Btn icon={GitFork} onClick={() => setTemplate(true)}>
-                  生成 Clos
-                </Btn>
-              </div>
-            }
-          >
-            {graph ? (
-              <TopologyView
-                graph={graph}
-                capacities={capacity(config)}
-                domain={domain}
-                setDomain={setDomain}
-                onSelect={setGroup}
-              />
-            ) : (
-              <Empty
-                icon={Network}
-                title="拓扑配置待修正"
-                detail={names.label(issues[0])}
-              />
-            )}
-            <div className="topo-footer">
-              <Btn icon={FileDown} onClick={exportWorkbook}>
-                下载 Excel 样表
-              </Btn>
-              <Btn
-                icon={Braces}
-                onClick={() =>
-                  download(
-                    "Clos-拓扑配置.json",
-                    JSON.stringify({ config, display: names.display }, null, 2),
-                    "application/json",
-                  )
-                }
-              >
-                导出 JSON
-              </Btn>
-            </div>
-          </Panel>
-          <Panel
-            title="对象属性"
-            icon={Settings2}
-            sub={
-              "当前值用于基线，候选范围单独保存 · 已开放 " +
-              enabledCount +
-              " 个维度"
-            }
-          >
-            <div className="panel-body side-fields">
-              <Select
-                label="属性分组"
-                value={group}
-                options={groups.map((g) => g[0])}
-                onChange={setGroup}
-              />
-              <ConfigFields
-                config={config}
-                update={update}
-                keys={groups.find((g) => g[0] === group)[1].split(" ")}
-                project={project}
-                updateSearch={updateSearch}
-              />
-              {group === "存量与新增资源" && (
-                <div className="resource-parameter resource-distribution">
-                  <Select
-                    label="接入与流量分布"
-                    value={config.distribution}
-                    options={["集中", "均衡"]}
-                    onChange={(distribution) =>
-                      update({ distribution, attachments: undefined })
-                    }
-                  />
-                  <DimensionControl
-                    dimension={NETWORK_DIMENSIONS.find(
-                      (entry) => entry.field === "distribution",
-                    )}
-                    project={project}
-                    updateSearch={updateSearch}
-                  />
-                </div>
-              )}
-            </div>
-          </Panel>
-        </div>
-      )}
-      {tab === "设备清单" && (
-        <Panel
-          title="设备清单"
-          sub="设备类型与资产状态分开记录，沿用设备的标签可在展示设置中命名。"
-          action={<Badge>{graph?.devices.length ?? 0} 台</Badge>}
-        >
-          {graph ? (
-            <div className="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    {[
-                      "设备编号",
-                      "网络域",
-                      "类型",
-                      "生命周期",
-                      "物理端口",
-                      "接入节点",
-                    ].map((t) => (
-                      <th key={t}>{t}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {graph.devices.map((d) => (
-                    <tr key={d.id}>
-                      <td>
-                        <b>{d.id}</b>
-                      </td>
-                      <td>{names.domain(d.plane)}</td>
-                      <td>{d.type}</td>
-                      <td>
-                        <Badge tone={ROLE_STYLE[d.role]}>
-                          {names.role(d.role)}
-                        </Badge>
-                      </td>
-                      <td>{d.ports}</td>
-                      <td>{d.nodes ?? "—"}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          ) : (
-            <Empty title="配置待校验" detail={names.label(issues[0])} />
-          )}
-        </Panel>
-      )}
-      {tab === "连接关系" && (
-        <Panel
-          title="物理连接与端口"
-          sub="可从 Excel 的 Links 和 Attachments 表批量修改连接及接入关系。"
-          action={
-            <>
-              <Btn icon={FileDown} onClick={exportWorkbook}>
-                导出连接
-              </Btn>
-              {(config.connections || config.attachments) && (
-                <Btn
-                  onClick={() =>
-                    update({
-                      connections: undefined,
-                      connectionDomains: undefined,
-                      attachments: undefined,
-                    })
-                  }
-                >
-                  恢复模板连接
-                </Btn>
-              )}
-            </>
+    <Panel
+      title="拓扑待导入"
+      sub={project.migrationIssue ?? "请导入有效的设备、端口及链路配置。"}
+    >
+      <div className="panel-body actions">
+        <label className="btn">
+          <Upload size={16} />
+          批量导入
+          <input
+            type="file"
+            accept=".json,.xlsx,.xls"
+            onChange={importFile}
+            hidden
+          />
+        </label>
+        <Btn
+          onClick={() =>
+            download(
+              "原始配置.json",
+              JSON.stringify(
+                {
+                  config,
+                  workload: project.workload,
+                  limits: project.limits,
+                  search: project.search,
+                  display: project.display,
+                },
+                null,
+                2,
+              ),
+              "application/json",
+            )
           }
         >
-          {graph ? (
-            <div className="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    {[
-                      "源设备",
-                      "目标设备",
-                      "网络域",
-                      "类型",
-                      "物理端口",
-                      "总带宽",
-                    ].map((t) => (
-                      <th key={t}>{t}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {graph.links
-                    .filter((l) => l.ports > 0)
-                    .map((l) => (
-                      <tr key={l.id}>
-                        <td>{l.a}</td>
-                        <td>{l.b}</td>
-                        <td>{names.domain(l.plane)}</td>
-                        <td>{l.type}</td>
-                        <td>{l.ports}</td>
-                        <td>{l.gbps} Gbps</td>
-                      </tr>
-                    ))}
-                </tbody>
-              </table>
-            </div>
-          ) : (
-            <Empty title="配置待校验" detail={names.label(issues[0])} />
-          )}
-        </Panel>
-      )}
-      {tab === "存储画像与成本" && (
-        <div className="form-grid two">
-          {groups.slice(2).map(([name, keys]) => (
-            <Panel key={name} title={name}>
-              <div className="panel-body">
-                <ConfigFields
-                  config={config}
-                  update={update}
-                  keys={keys.split(" ")}
-                />
-              </div>
-            </Panel>
-          ))}
-        </div>
-      )}
-      {displayDraft && (
-        <Modal title="拓扑展示设置" close={() => setDisplayDraft(null)}>
-          <form
-            className="modal-body new-form"
-            onSubmit={(event) => {
-              event.preventDefault();
-              try {
-                patch({ display: readDisplay(displayDraft, names.display) });
-                setDisplayDraft(null);
-                notify("项目展示设置已保存");
-              } catch (error) {
-                notify(error.message, "error");
-              }
-            }}
-          >
-            <p>名称随项目保存。设备和端点编号可继续用于导入与复跑。</p>
-            {Object.entries(displayDraft.domains).map(([id, value], index) => (
-              <Field
-                key={id}
-                label={"网络域 " + (index + 1) + " 名称"}
-                type="text"
-                value={value}
-                onChange={(name) =>
-                  setDisplayDraft({
-                    ...displayDraft,
-                    domains: {
-                      ...displayDraft.domains,
-                      [id]: name.slice(0, 24),
-                    },
-                  })
-                }
-              />
-            ))}
-            <Field
-              label="沿用设备的标签"
-              type="text"
-              value={displayDraft.assigned}
-              onChange={(value) =>
-                setDisplayDraft({
-                  ...displayDraft,
-                  assigned: value.slice(0, 12),
-                })
-              }
-            />
-            <div className="actions end">
-              <Btn primary type="submit" icon={Check}>
-                保存展示设置
-              </Btn>
-            </div>
-          </form>
-        </Modal>
-      )}
-      {template && (
-        <Modal title="从标准 Clos 模板生成" close={() => setTemplate(false)}>
-          <div className="modal-body">
-            <p>
-              生成双网络域两级 Clos。使用当前配置中的设备数量和端口档位，重建
-              Leaf 到 Spine 的连接和资源池接入。
-            </p>
-            <div className="actions end">
-              <Btn onClick={() => setTemplate(false)}>返回</Btn>
-              <Btn
-                primary
-                icon={GitFork}
-                onClick={() => {
-                  update({
-                    connections: undefined,
-                    connectionDomains: undefined,
-                    attachments: undefined,
-                  });
-                  setTemplate(false);
-                  notify("Clos 模板连接已生成");
-                }}
-              >
-                生成拓扑
-              </Btn>
-            </div>
-          </div>
-        </Modal>
-      )}
-    </>
+          导出原始配置
+        </Btn>
+      </div>
+    </Panel>
   );
 }
 
@@ -2789,9 +2471,15 @@ const objectiveNames = {
 const plannedConfig = (row, analysis) =>
   row.config ?? applyObjectChanges(analysis.input.config, row.changes);
 const objectChangeValue = (field, value) =>
-  field === "gbps" ? value + " Gbps" : value ? "启用" : "停用";
+  field === "current"
+    ? String(value)
+    : field === "gbps"
+      ? value + " Gbps"
+      : value
+        ? "启用"
+        : "停用";
 const describeChange = (change) =>
-  change.id +
+  (change.name ?? change.id) +
   " · " +
   objectChangeValue(change.field, change.current) +
   " → " +
@@ -2800,7 +2488,7 @@ const describeChange = (change) =>
 function EvaluationPlans({
   project,
   view,
-  currentFault,
+  selectedFaults,
   inspect,
   task,
   analysis,
@@ -2814,9 +2502,9 @@ function EvaluationPlans({
   const data = analysis?.result;
   const stale =
     analysis &&
-    (!same(analysis.input, snapshot(project)) ||
+    (!same(withoutFaults(analysis.input), snapshot(project)) ||
       !same(analysis.search, project.search) ||
-      Boolean(analysis.fault) !== currentFault);
+      !same(faultsOf(analysis.input), selectedFaults));
   const rec = data?.rows.find((r) => r.id === data.recommended);
   const objectMode = Boolean((analysis?.input.config ?? project.config).model);
   const pickedConfig =
@@ -2958,6 +2646,34 @@ function EvaluationPlans({
           "，" +
           (c.pass ? "通过" : "未通过"),
       ),
+      ...(p.faultResults?.length
+        ? [
+            "",
+            "## 逐项故障校核",
+            ...p.faultResults.flatMap(({ target, status, summary, reason }) => [
+              "- " +
+                (target.label ?? target.id) +
+                " · " +
+                faultStatus[status] +
+                (reason ? " · " + reason : ""),
+              ...(summary?.checks.map(
+                (check) =>
+                  "  - " +
+                  names.label(check.label) +
+                  " " +
+                  format(check.value, 3) +
+                  " " +
+                  check.unit +
+                  "（目标 " +
+                  (check.max ? "≤" : "≥") +
+                  check.limit +
+                  "，" +
+                  (check.pass ? "通过" : "未通过") +
+                  "）",
+              ) ?? []),
+            ]),
+          ]
+        : []),
       ...(p.fault
         ? [
             "",
@@ -3180,7 +2896,10 @@ function EvaluationPlans({
                             <Status
                               pass={
                                 baseline.summary.pass &&
-                                (data.baselineFault?.pass ?? true)
+                                (data.baselineFault?.pass ?? true) &&
+                                (data.baselineFaultResults ?? []).every(
+                                  ({ status }) => status === "passed",
+                                )
                               }
                             />
                           ) : (
@@ -3375,9 +3094,13 @@ function EvaluationPlans({
                           change.field
                         }
                       >
-                        <td>{change.id}</td>
+                        <td>{change.name ?? change.id}</td>
                         <td>
-                          {change.field === "gbps" ? "链路速率" : "启用状态"}
+                          {change.field === "current"
+                            ? "批量规则"
+                            : change.field === "gbps"
+                              ? "链路速率"
+                              : "启用状态"}
                         </td>
                         <td>
                           {objectChangeValue(change.field, change.current)}
@@ -3505,6 +3228,10 @@ function EvaluationPlans({
                     </tbody>
                   </table>
                 </div>
+                <FaultResults
+                  results={picked.faultResults}
+                  normal={picked.result}
+                />
                 <div className="actions end">
                   <Btn
                     icon={Check}
@@ -3549,22 +3276,35 @@ function App() {
   const [plan, setPlan] = useState("");
   const [previewPlan, setPreviewPlan] = useState(null);
   const [workbenchTab, setWorkbenchTab] = useState("results");
-  const [fault, setFault] = useState(false);
+  const [selectedFaults, setSelectedFaults] = useState([]);
   const [dialog, setDialog] = useState(null);
   const [toast, setToast] = useState(null);
   const [menu, setMenu] = useState(false);
   const [name, setName] = useState("");
   const [kind, setKind] = useState("通用网络规划");
-  const [starter, setStarter] = useState("objects");
+  const [starter, setStarter] = useState("clos");
+  const [clusterCount, setClusterCount] = useState(1);
+  const [closSettings, setClosSettings] = useState({
+    spines: 2,
+    computeLeaves: 2,
+    storageLeaves: 2,
+    uplinks: 2,
+    uplinkGbps: 100,
+    accessGbps: 100,
+  });
   const worker = useRef(null);
   const notified = useRef(null);
   const p = db.projects.find((x) => x.id === db.active) ?? db.projects[0];
   const currentPlan =
     previewPlan?.id === plan ? previewPlan : p.plans.find((x) => x.id === plan);
-  const selectedModel = (currentPlan?.input.config ?? p.config).model;
-  useEffect(() => {
-    if (selectedModel && !selectedModel.faultDevices?.length) setFault(false);
-  }, [selectedModel]);
+  function selectPlan(id) {
+    const selected =
+      previewPlan?.id === id
+        ? previewPlan
+        : p.plans.find((item) => item.id === id);
+    setPlan(id);
+    setSelectedFaults(faultsOf(selected?.input));
+  }
   const notify = (message, type = "ok") => {
     clearTimeout(notified.current);
     setToast({ message, type });
@@ -3619,7 +3359,7 @@ function App() {
     setPlan("");
     setPreviewPlan(null);
     setWorkbenchTab("results");
-    setFault(false);
+    setSelectedFaults([]);
     setDialog(null);
     changePage("simulation");
   }
@@ -3650,98 +3390,95 @@ function App() {
         notify(data.error, "error");
         return;
       }
-      if (type === "search") {
-        const { baselineDetail, ...analysisResult } = data.result;
-        const selectedFault = Boolean(options.fault);
-        const fresh = baselineDetail && {
-          id: uuid(),
-          time,
-          input,
-          fault: selectedFault,
-          plan: "",
-          label: "项目基线",
-          summary: summary(baselineDetail),
-        };
-        const cachedMetrics = selectedFault
-          ? analysisResult.baselineFault
-          : analysisResult.baseline;
-        setResult((previous) => {
-          if (fresh) return { ...fresh, result: baselineDetail };
-          if (
-            previous &&
-            !previous.partial &&
-            previous.fault === selectedFault &&
-            same(previous.input, input)
-          )
-            return { ...previous, plan: "", label: "项目基线" };
-          return cachedMetrics
-            ? {
-                time,
-                input,
-                fault: selectedFault,
-                plan: "",
-                label: "项目基线",
-                summary: cachedMetrics,
-                result: cachedMetrics,
-                partial: true,
-              }
+      const searchRun = type === "search";
+      const { baselineDetail, ...analysisResult } = searchRun
+        ? data.result
+        : {};
+      const metrics = searchRun
+        ? (baselineDetail ?? analysisResult.baseline)
+        : data.result;
+      const faultResults =
+        (searchRun ? analysisResult.baselineFaultResults : data.faultResults) ??
+        options.faultResults ??
+        [];
+      const entry = metrics && {
+        id: options.entry?.id ?? uuid(),
+        time: options.entry?.time ?? time,
+        input,
+        fault: options.fault ?? false,
+        plan: options.plan ?? "",
+        label: options.label ?? "项目基线",
+        summary: summary(metrics),
+        faultResults,
+      };
+      setResult((previous) => {
+        if (!entry) return null;
+        const full = Array.isArray(metrics.links)
+          ? metrics
+          : previous &&
+              !previous.partial &&
+              !entry.fault &&
+              !previous.fault &&
+              same(withoutFaults(previous.input), withoutFaults(input))
+            ? previous.result
             : null;
-        });
+        return { ...entry, result: full ?? metrics, partial: !full };
+      });
+      if (
+        searchRun ||
+        (entry && !options.entry && !options.preview && !options.skipHistory)
+      ) {
         patchFor(p.id, (previous) => ({
-          analysis: {
-            time,
-            input,
-            search: options.search,
-            objective: options.search.objective,
-            fault: selectedFault,
-            cachedBaseline: Boolean(
-              selectedFault
-                ? options.cached?.baselineFault
-                : options.cached?.baseline,
-            ),
-            result: analysisResult,
-          },
-          ...(fresh
-            ? { history: [fresh, ...previous.history].slice(0, 40) }
+          ...(searchRun
+            ? {
+                analysis: {
+                  time,
+                  input,
+                  search: options.search,
+                  objective: options.search.objective,
+                  cachedBaseline: Boolean(options.cached?.baseline),
+                  result: analysisResult,
+                },
+              }
+            : {}),
+          ...(entry &&
+          !previous.history.some(
+            (item) =>
+              item.plan === entry.plan &&
+              !item.fault &&
+              !entry.fault &&
+              same(item.input, entry.input),
+          )
+            ? { history: [entry, ...previous.history].slice(0, 40) }
             : {}),
         }));
-        notify(
-          analysisResult.recommended
-            ? "评估完成 · " + analysisResult.feasible + " 个可行方案"
-            : "评估完成 · 无可行方案",
+      }
+      if (options.scroll)
+        requestAnimationFrame(() =>
+          document
+            .getElementById("evaluation-diagnostics")
+            ?.scrollIntoView({ block: "start", behavior: "smooth" }),
         );
-      } else {
-        const entry = {
-          id: options.entry?.id ?? uuid(),
-          time: options.entry?.time ?? time,
-          input,
-          fault: !!options.fault,
-          plan: options.plan ?? "",
-          label: options.label ?? "项目基线",
-          summary: summary(data.result),
-        };
-        setResult({ ...entry, result: data.result });
-        if (!options.entry && !options.preview && !options.skipHistory)
-          patchFor(p.id, (prev) => ({
-            history: [entry, ...prev.history].slice(0, 40),
-          }));
-        if (options.scroll)
-          requestAnimationFrame(() =>
-            document
-              .getElementById("evaluation-diagnostics")
-              ?.scrollIntoView({ block: "start", behavior: "smooth" }),
-          );
-        if (!options.quiet)
-          notify(
-            "评估完成 · " +
-              (data.result.pass ? "全部约束通过" : "存在未达标项"),
-          );
+      if (!options.quiet) {
+        const pass =
+          metrics?.pass &&
+          faultResults.every(({ status }) => status === "passed");
+        notify(
+          searchRun
+            ? "评估完成 · " +
+                (analysisResult.recommended
+                  ? analysisResult.feasible + " 个可行方案"
+                  : "无可行方案")
+            : "评估完成 · " + (pass ? "全部约束通过" : "存在未达标或不适用项"),
+        );
       }
     };
     proc.postMessage({
       type,
       ...input,
       fault: options.fault,
+      faults: faultsOf(input),
+      detailOnly: options.detailOnly,
       search: options.search,
       cached: options.cached,
       detail: options.detail,
@@ -3751,7 +3488,7 @@ function App() {
     const selected = over?.plan ?? currentPlan;
     const input =
       over?.entry?.input ?? over?.input ?? selected?.input ?? snapshot(p);
-    const selectedFault = over?.entry?.fault ?? over?.fault ?? fault;
+    const selectedFault = over?.entry?.fault ?? over?.fault ?? false;
     launch("simulate", input, {
       ...over,
       fault: selectedFault,
@@ -3762,56 +3499,68 @@ function App() {
   }
   function evaluate() {
     if (worker.current) return;
+    if (!currentPlan && p.migrationIssue) {
+      notify("请先在资源页导入可用的对象拓扑", "error");
+      changePage("resources");
+      return;
+    }
     setWorkbenchTab("results");
-    const input = currentPlan?.input ?? snapshot(p);
-    const match = (item, scene) =>
-      item && item.fault === scene && same(item.input, input);
-    const memory = match(result, fault) ? result : null;
+    const base = withoutFaults(currentPlan?.input ?? snapshot(p));
+    const input = selectedFaults.length
+      ? { ...base, faults: clone(selectedFaults) }
+      : base;
+    const matchesBase = (item) =>
+      item && !item.fault && same(withoutFaults(item.input), base);
+    const memory = matchesBase(result) ? result : null;
+    const history = p.history.find(matchesBase);
+    const prior = matchesBase(p.analysis) ? p.analysis : null;
+    const sameFaults = (item) =>
+      item && same(faultsOf(item.input), selectedFaults);
+    const previousFaultResults = sameFaults(memory)
+      ? memory.faultResults
+      : undefined;
+    const recorded =
+      selectedFaults.length &&
+      p.history.find((item) => matchesBase(item) && sameFaults(item));
+    const baselineFaultResults = !selectedFaults.length
+      ? []
+      : (previousFaultResults ??
+        recorded?.faultResults ??
+        (sameFaults(prior) ? prior.result.baselineFaultResults : undefined) ??
+        (sameFaults(currentPlan) ? currentPlan.faultResults : undefined));
+    const baseline =
+      memory?.summary ??
+      history?.summary ??
+      (prior?.result.baseline ? summary(prior.result.baseline) : undefined) ??
+      (currentPlan?.result ? summary(currentPlan.result) : undefined);
+    const cached = { baseline, baselineFaultResults };
     const enabled = activeDimensions(input.config, p.search).length > 0;
-    const prior =
-      p.analysis && same(p.analysis.input, input) ? p.analysis.result : null;
-    const historical = (scene) => p.history.find((item) => match(item, scene));
-    const cached = {
-      baseline:
-        (match(result, false) ? result.summary : null) ??
-        historical(false)?.summary ??
-        prior?.baseline,
-      baselineFault:
-        (match(result, true) ? result.summary : null) ??
-        historical(true)?.summary ??
-        prior?.baselineFault,
-    };
     if (currentPlan || !enabled) {
-      const stored =
-        (fault ? cached.baselineFault : cached.baseline) ??
-        (fault ? currentPlan?.fault : currentPlan?.result);
-      if (memory || stored) {
-        const reused = memory ?? {
+      if (baseline && baselineFaultResults) {
+        setResult({
           time:
-            historical(fault)?.time ??
+            memory?.time ??
+            history?.time ??
             currentPlan?.time ??
-            p.analysis?.time ??
+            prior?.time ??
             Date.now(),
           input,
-          fault,
-          result: stored,
-          summary: stored,
-          partial: true,
-        };
-        setResult({
-          ...reused,
+          fault: false,
           plan: currentPlan?.id ?? "",
           label: currentPlan?.name ?? "项目基线",
+          result: memory?.result ?? baseline,
+          summary: baseline,
+          faultResults: baselineFaultResults,
+          partial: !memory || memory.partial,
         });
         notify("已复用相同输入的评估结果");
-      } else run();
+      } else run({ input, cached });
       return;
     }
     launch("search", input, {
       search: clone(p.search),
-      fault,
       cached,
-      detail: !(fault ? cached.baselineFault : cached.baseline),
+      detail: !baseline,
     });
   }
 
@@ -3824,35 +3573,38 @@ function App() {
     };
     setPreviewPlan(candidate);
     setPlan(candidate.id);
+    setSelectedFaults(faultsOf(candidate.input));
     setWorkbenchTab("results");
-    run({ plan: candidate, fault, scroll: true });
+    run({
+      plan: candidate,
+      cached: { baselineFaultResults: row.faultResults },
+      scroll: true,
+    });
   }
 
   function baselineDetails() {
-    if (result?.partial) {
-      setPlan(result.plan);
-      setFault(result.fault);
-      run({
-        input: result.input,
-        fault: result.fault,
-        plan: {
-          id: result.plan,
-          name: result.label,
-          preview: currentPlan?.preview,
-        },
-        skipHistory: true,
-        scroll: true,
-      });
-      return;
-    }
-    const analysis = p.analysis;
-    if (!analysis) return;
-    const scene = Boolean(analysis.fault);
-    setPlan("");
-    setFault(scene);
+    const input = result?.partial ? result.input : p.analysis?.input;
+    if (!input) return;
+    const requested = result?.partial
+      ? result
+      : {
+          plan: "",
+          label: "项目基线",
+          fault: false,
+          faultResults: p.analysis?.result.baselineFaultResults,
+        };
+    setPlan(requested.plan);
+    setSelectedFaults(faultsOf(input));
     run({
-      plan: { id: "", name: "项目基线", input: analysis.input },
-      fault: scene,
+      input,
+      fault: requested.fault,
+      plan: {
+        id: requested.plan,
+        name: requested.label,
+        preview: currentPlan?.preview,
+      },
+      detailOnly: true,
+      faultResults: requested.faultResults,
       skipHistory: true,
       scroll: true,
     });
@@ -3860,63 +3612,26 @@ function App() {
   function addProject() {
     if (!name.trim()) return;
     const id = uuid();
-    const d = clone(seed);
-    if (starter === "objects") {
-      const { model, workload, limits, search } = singleClusterBundle();
-      Object.assign(d, {
-        config: { model },
-        workload,
-        limits,
-        search,
-        display: clone(DEFAULT_DISPLAY),
-      });
-    } else {
-      d.display = clone(DEFAULT_DISPLAY);
-      if (kind === "网络容量规划")
-        d.display.domains = { D01: "现网域", D02: "扩容域" };
-      Object.assign(d.config, {
-        spines: 4,
-        domain01Leaves: 4,
-        domain02Leaves: 4,
-        domain01StorageLeaves: 4,
-        reuseInventory: 0,
-        reuseLeaves: 0,
-        newLeaves: 8,
-        domain01Nodes: 32,
-        sharedNodes: 0,
-        sharedPB: 0,
-        domain01StoragePB: 4,
-        newNodes: 32,
-        distribution: "均衡",
-      });
-      Object.assign(d.limits, {
-        domain01PB: 4,
-        domain02PB: 6,
-        domain01GBps: 80,
-        domain02GBps: 180,
-        domain01IOPS: 3000,
-        domain02IOPS: 6000,
-      });
-      d.workload.profiles = d.workload.profiles.map((x, i) => ({
-        ...x,
-        model: i ? "目标业务" : "现网业务",
-        peak: i ? 72 : 48,
-      }));
-      d.search.reuse = "0";
-      d.workload.services = [
-        serviceProfile("D01", "参考服务"),
-        serviceProfile("D02", "目标服务"),
-      ];
+    let generated;
+    try {
+      generated = newTopologyProject(starter, clusterCount, closSettings);
+      inspectModel(generated.config.model);
+    } catch (error) {
+      notify(error.message, "error");
+      return;
     }
     const item = {
-      ...d,
+      ...generated,
       id,
       name: name.trim(),
       kind,
+      history: [],
+      plans: [],
+      display: clone(DEFAULT_DISPLAY),
       description:
-        starter === "objects"
-          ? "从对象拓扑模板创建，可导入任意集群、设备型号与物理连接。"
-          : "从双网络域 Clos 模板创建，可编辑设备、端口、负载与约束。",
+        starter === "clos"
+          ? "由 Clos 参数生成的对象拓扑，可按分组或逐设备编辑。"
+          : "使用统一对象拓扑，可导入现网或逐项建模。",
     };
     abort();
     setDb((prev) => ({ active: id, projects: [item, ...prev.projects] }));
@@ -3924,7 +3639,7 @@ function App() {
     setPlan("");
     setPreviewPlan(null);
     setWorkbenchTab("results");
-    setFault(false);
+    setSelectedFaults([]);
     setDialog(null);
     changePage("resources");
     notify("项目已创建");
@@ -3952,6 +3667,7 @@ function App() {
       ...(row.changes ? { changes: row.changes } : {}),
       result: row.result,
       fault: row.fault,
+      faultResults: row.faultResults,
       baseCost: cost(analysis.input.config).total,
     };
     patchFor(p.id, (prev) => ({ plans: [item, ...prev.plans] }));
@@ -3959,9 +3675,13 @@ function App() {
   }
   function verify(item) {
     setPlan(item.id);
-    setFault(false);
+    setSelectedFaults(faultsOf(item.input));
     setWorkbenchTab("results");
-    run({ plan: item, fault: false, scroll: true });
+    run({
+      plan: item,
+      cached: { baselineFaultResults: item.faultResults },
+      scroll: true,
+    });
   }
   const current = MODULES.find((m) => m[0] === page);
   return (
@@ -4068,7 +3788,16 @@ function App() {
                 create={() => {
                   setName("");
                   setKind("通用网络规划");
-                  setStarter("objects");
+                  setStarter("clos");
+                  setClusterCount(1);
+                  setClosSettings({
+                    spines: 2,
+                    computeLeaves: 2,
+                    storageLeaves: 2,
+                    uplinks: 2,
+                    uplinkGbps: 100,
+                    accessGbps: 100,
+                  });
                   setDialog("new");
                 }}
                 duplicate={duplicate}
@@ -4096,13 +3825,13 @@ function App() {
                 task={task}
                 result={result}
                 plan={plan}
-                setPlan={setPlan}
+                setPlan={selectPlan}
                 selectedPlan={currentPlan}
                 setObjective={(objective) =>
                   patch({ search: { ...p.search, objective } })
                 }
-                fault={fault}
-                setFault={setFault}
+                selectedFaults={selectedFaults}
+                setSelectedFaults={setSelectedFaults}
                 details={details}
                 setDetails={setDetails}
                 openHistory={() => setDialog("history")}
@@ -4119,7 +3848,7 @@ function App() {
                       activeDimensions(p.config, p.search).length > 0)) && (
                     <EvaluationPlans
                       view="results"
-                      currentFault={fault}
+                      selectedFaults={selectedFaults}
                       project={p}
                       task={task}
                       analysis={p.analysis}
@@ -4224,15 +3953,53 @@ function App() {
               value={starter}
               onChange={setStarter}
               options={[
-                ["objects", "单集群对象拓扑"],
-                ["standard", "双域 Clos 参数模板"],
+                ["clos", "从 Clos 生成"],
+                ["import", "导入现网"],
+                ["blank", "空白建模"],
               ]}
             />
-            <p className="muted">
-              {starter === "objects"
-                ? "资源页按集群、物理网络、型号、设备、端口、链路和资源池编辑，可在模板上增加集群。"
-                : "资源页按设备数量、端口档位和资源池参数生成双域 Clos，与哈尔滨预置项目使用同一种编辑界面。"}
-            </p>
+            {starter === "clos" ? (
+              <>
+                <p className="muted">
+                  生成后进入同一个对象拓扑资源页。以下规模按每个集群计算。
+                </p>
+                <div className="form-grid three">
+                  <Field
+                    label="集群数量"
+                    value={clusterCount}
+                    min={1}
+                    max={8}
+                    onChange={setClusterCount}
+                  />
+                  {[
+                    ["spines", "Spine 数", 1, 8],
+                    ["computeLeaves", "计算 Leaf 数", 1, 16],
+                    ["storageLeaves", "存储 Leaf 数", 0, 16],
+                    ["uplinks", "每台 Leaf 上联", 1, 8],
+                    ["uplinkGbps", "上联速率", 1, 1600, "Gbps"],
+                    ["accessGbps", "接入速率", 1, 1600, "Gbps"],
+                  ].map(([key, label, min, max, suffix]) => (
+                    <Field
+                      key={key}
+                      label={label}
+                      value={closSettings[key]}
+                      min={min}
+                      max={max}
+                      suffix={suffix}
+                      onChange={(value) =>
+                        setClosSettings({ ...closSettings, [key]: value })
+                      }
+                    />
+                  ))}
+                </div>
+              </>
+            ) : (
+              <p className="muted">
+                {starter === "import"
+                  ? "创建后在资源页上传 JSON 或 Excel。"
+                  : "创建后在资源页添加集群、设备和连接。"}
+              </p>
+            )}
             <div className="actions end">
               <Btn type="button" onClick={() => setDialog(null)}>
                 取消
@@ -4257,13 +4024,24 @@ function App() {
                     <strong>{item.label}</strong>
                     <p>
                       {stamp(item.time)} ·{" "}
-                      {item.fault ? "SP01 故障" : "正常运行"} ·{" "}
-                      {item.summary.service ? "P99 首 token" : "P99 消息完成"}{" "}
+                      {item.fault
+                        ? "历史故障场景"
+                        : faultsOf(item.input).length
+                          ? "正常 + " + faultsOf(item.input).length + " 项故障"
+                          : "正常运行"}{" "}
+                      · {item.summary.service ? "P99 首 token" : "P99 消息完成"}{" "}
                       {format(item.summary.service?.p99 ?? item.summary.p99, 2)}{" "}
                       ms
                     </p>
                   </div>
-                  <Status pass={item.summary.pass} />
+                  <Status
+                    pass={
+                      item.summary.pass &&
+                      (item.faultResults ?? []).every(
+                        ({ status }) => status === "passed",
+                      )
+                    }
+                  />
                   <Btn
                     disabled={!!task}
                     onClick={() => {
@@ -4272,7 +4050,7 @@ function App() {
                           ? item.plan
                           : "",
                       );
-                      setFault(item.fault);
+                      setSelectedFaults(faultsOf(item.input));
                       setDialog(null);
                       run({ entry: item, quiet: true });
                     }}
